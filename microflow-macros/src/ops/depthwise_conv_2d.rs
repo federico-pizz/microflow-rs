@@ -12,6 +12,7 @@ use quote::{format_ident, quote, ToTokens};
 pub(crate) struct TokenDepthwiseConv2D<T: TokenQuantized> {
     pub(crate) weights: TokenTensor4D<T>,
     pub(crate) output: TokenTensor4D<T>,
+    pub(crate) input_shape: Vec<usize>,
     pub(crate) fused_activation: TokenFusedActivation,
     pub(crate) view_padding: TokenTensorViewPadding,
     pub(crate) strides: (usize, usize),
@@ -77,6 +78,7 @@ impl<T: TokenQuantized> TokenDepthwiseConv2D<T> {
         Self {
             weights,
             output,
+            input_shape: input.shape.clone(),
             fused_activation: options.fused_activation_function().into(),
             view_padding: options.padding().into(),
             strides: (options.stride_h() as usize, options.stride_w() as usize),
@@ -129,11 +131,11 @@ impl<T: TokenQuantized> ToTokens for TokenDepthwiseConv2D<T> {
         let (strides_0, strides_1) = self.strides;
         let (constants_0, constants_1) = &self.constants;
 
-        let ts = quote! {
-            const #weights_ident: #weights_type = #weights;
-            let mut input: microflow::tensor::Tensor4D<_, #(#output_shape),*, 1usize> =
-                microflow::ops::depthwise_conv_2d(
-                    input,
+        let ts = if self.input_shape == self.output.shape {
+            quote! {
+                const #weights_ident: #weights_type = #weights;
+                microflow::ops::depthwise_conv_2d_in_place(
+                    &mut input,
                     &#weights_ident,
                     [#(#output_scale),*],
                     [#(#output_zero_point),*],
@@ -143,7 +145,25 @@ impl<T: TokenQuantized> ToTokens for TokenDepthwiseConv2D<T> {
                         strides: (#strides_0, #strides_1),
                     },
                     (#constants_0, #constants_1)
-            );
+                );
+            }
+        } else {
+            quote! {
+                const #weights_ident: #weights_type = #weights;
+                let mut input: microflow::tensor::Tensor4D<_, #(#output_shape),*, 1usize> =
+                    microflow::ops::depthwise_conv_2d(
+                        input,
+                        &#weights_ident,
+                        [#(#output_scale),*],
+                        [#(#output_zero_point),*],
+                        microflow::ops::DepthwiseConv2DOptions {
+                            fused_activation: #fused_activation,
+                            view_padding: #view_padding,
+                            strides: (#strides_0, #strides_1),
+                        },
+                        (#constants_0, #constants_1)
+                );
+            }
         };
         ts.to_tokens(tokens);
     }
@@ -172,6 +192,7 @@ mod tests {
                 scale: vec![0.17],
                 zero_point: vec![18],
             },
+            input_shape: vec![1, 2, 3, 2],
             fused_activation: TokenFusedActivation::Relu6,
             view_padding: TokenTensorViewPadding::Same,
             strides: (1, 1),
@@ -218,18 +239,17 @@ mod tests {
             layer.to_token_stream().to_string(),
             quote! {
                 const weights_0: microflow::tensor::Tensor4D<i8, 1usize, 2usize, 3usize, 2usize, 2usize> = #weights;
-                let mut input: microflow::tensor::Tensor4D<_, 1usize, 2usize, 3usize, 2usize, 1usize> =
-                    microflow::ops::depthwise_conv_2d(
-                        input,
-                        &weights_0,
-                        [0.17f32],
-                        [18i8],
-                        microflow::ops::DepthwiseConv2DOptions {
-                            fused_activation: #fused_activation,
-                            view_padding: #view_padding,
-                            strides: (1usize, 1usize),
-                        },
-                        (#constants_0, #constants_1)
+                microflow::ops::depthwise_conv_2d_in_place(
+                    &mut input,
+                    &weights_0,
+                    [0.17f32],
+                    [18i8],
+                    microflow::ops::DepthwiseConv2DOptions {
+                        fused_activation: #fused_activation,
+                        view_padding: #view_padding,
+                        strides: (1usize, 1usize),
+                    },
+                    (#constants_0, #constants_1)
                 );
             }.to_string()
         );

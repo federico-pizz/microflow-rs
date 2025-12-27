@@ -104,6 +104,63 @@ pub fn depthwise_conv_2d<
     Tensor4D::new(output, output_scale, output_zero_point)
 }
 
+/// Performs the DepthwiseConv2D operation in-place on the input tensor.
+/// Assumes input and output shapes match.
+///
+/// # Arguments
+/// * `input` - The mutable 4-dimensional input tensor
+/// * `weights` - The 4-dimensional tensor representing the weights of the operator
+/// * `output_scale` - The scale of the resulting output tensor
+/// * `output_zero_point` - The zero point of the resulting output tensor
+/// * `options` - Operator's options as an [`DepthwiseConv2DOptions`] struct
+/// * `constants` - Constant values coming from the pre-processing phase
+///
+pub fn depthwise_conv_2d_in_place<
+    T: Quantized + Default,
+    const INPUT_ROWS: usize,
+    const INPUT_COLS: usize,
+    const INPUT_CHANS: usize,
+    const WEIGHTS_ROWS: usize,
+    const WEIGHTS_COLS: usize,
+    const WEIGHTS_CHANS: usize,
+    const WEIGHTS_QUANTS: usize,
+>(
+    input: &mut Tensor4D<T, 1, INPUT_ROWS, INPUT_COLS, INPUT_CHANS, 1>,
+    weights: &Tensor4D<T, 1, WEIGHTS_ROWS, WEIGHTS_COLS, WEIGHTS_CHANS, WEIGHTS_QUANTS>,
+    output_scale: [f32; 1],
+    output_zero_point: [T; 1],
+    options: DepthwiseConv2DOptions,
+    constants: (
+        Buffer2D<f32, WEIGHTS_CHANS, 1>,
+        Buffer2D<f32, WEIGHTS_QUANTS, 1>,
+    ),
+) {
+    let mut temp = Buffer2D::<T, INPUT_ROWS, INPUT_COLS>::from_element(T::default());
+    for chan in 0..WEIGHTS_CHANS {
+        for i in 0..INPUT_ROWS {
+            for j in 0..INPUT_COLS {
+                let view: TensorView<T, WEIGHTS_ROWS, WEIGHTS_COLS, INPUT_CHANS> = input.view((i, j), 0, options.view_padding, options.strides);
+                let mut sum = constants.0[(chan, 0)];
+                for fi in 0..WEIGHTS_ROWS {
+                    for fj in 0..WEIGHTS_COLS {
+                        sum += (f32::from_subset(&view.buffer[(fi, fj)][chan]) - f32::from_subset(&input.zero_point[0]))
+                            * (f32::from_subset(&weights.buffer[0][(fi, fj)][chan]) - f32::from_subset(&weights.zero_point[0]));
+                    }
+                }
+                temp[(i, j)] = crate::quantize::quantize(sum * constants.1[(0, 0)], output_scale[0], output_zero_point[0]);
+            }
+        }
+        // Copy temp to input for this chan
+        for i in 0..INPUT_ROWS {
+            for j in 0..INPUT_COLS {
+                input.buffer[0][(i, j)][chan] = temp[(i, j)];
+            }
+        }
+    }
+    input.scale = output_scale;
+    input.zero_point = output_zero_point;
+}
+
 #[cfg(test)]
 mod tests {
     use nalgebra::matrix;

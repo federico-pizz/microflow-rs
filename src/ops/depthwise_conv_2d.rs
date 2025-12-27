@@ -148,6 +148,11 @@ pub fn depthwise_conv_2d_in_place<
                     }
                 }
                 temp[(i, j)] = crate::quantize::quantize(sum * constants.1[(0, 0)], output_scale[0], output_zero_point[0]);
+                temp[(i, j)] = match options.fused_activation {
+                    FusedActivation::None => temp[(i, j)],
+                    FusedActivation::Relu => relu(temp[(i, j)], output_zero_point[0]),
+                    FusedActivation::Relu6 => relu6(temp[(i, j)], output_scale[0], output_zero_point[0]),
+                };
             }
         }
         // Copy temp to input for this chan

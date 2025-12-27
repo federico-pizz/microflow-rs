@@ -50,7 +50,7 @@ impl ToTokens for TokenReshape {
         };
 
         let ts = quote! {
-            let input: microflow::tensor::#output_tensor<_, #(#output_shape),*, 1usize> =
+            let mut input: microflow::tensor::#output_tensor<_, #(#output_shape),*, 1usize> =
                 microflow::ops::reshape(input);
         };
         ts.to_tokens(tokens)
@@ -73,7 +73,7 @@ mod tests {
         assert_eq!(
             layer.to_token_stream().to_string(),
             quote! {
-                let input: microflow::tensor::Tensor2D<_, 2usize, 3usize, 1usize> =
+                let mut input: microflow::tensor::Tensor2D<_, 2usize, 3usize, 1usize> =
                     microflow::ops::reshape(input);
             }
             .to_string()

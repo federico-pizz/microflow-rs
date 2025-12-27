@@ -46,13 +46,11 @@ impl<T: TokenQuantized> TokenSoftmax<T> {
 
 impl<T: TokenQuantized> ToTokens for TokenSoftmax<T> {
     fn to_tokens(&self, tokens: &mut TokenStream2) {
-        let output_shape = &self.output.shape;
         let output_scale = &self.output.scale;
         let output_zero_point = &self.output.zero_point;
 
         let ts = quote! {
-            let input: microflow::tensor::Tensor2D<_, #(#output_shape),*, 1usize> =
-                microflow::ops::softmax(input, [#(#output_scale),*], [#(#output_zero_point),*]);
+            microflow::ops::softmax_in_place(&mut input, [#(#output_scale),*], [#(#output_zero_point),*]);
         };
         ts.to_tokens(tokens);
     }
@@ -80,8 +78,7 @@ mod tests {
         assert_eq!(
             layer.to_token_stream().to_string(),
             quote! {
-                let input: microflow::tensor::Tensor2D<_, 2usize, 3usize, 1usize> =
-                    microflow::ops::softmax(input, [0.3f32], [4i8]);
+                microflow::ops::softmax_in_place(&mut input, [0.3f32], [4i8]);
             }
             .to_string()
         )

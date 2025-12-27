@@ -115,7 +115,7 @@ impl<T: TokenQuantized> ToTokens for TokenResizeBilinear<T> {
         let (constants_0, constants_1) = self.constants;
 
         let resize_bilinear = quote! {
-            let input: microflow::tensor::Tensor4D<_, 1, #output_rows, #output_cols, #output_chans, 1> = microflow::ops::resize_bilinear(
+            let mut input: microflow::tensor::Tensor4D<_, 1, #output_rows, #output_cols, #output_chans, 1> = microflow::ops::resize_bilinear(
                 input,
                 [#(#output_scale),*],
                 [#(#output_zero_point),*],
@@ -150,7 +150,7 @@ mod tests {
         };
 
         let expected = quote! {
-            let input: microflow::tensor::Tensor4D<_, 1, 224usize, 224usize, 3usize, 1> = microflow::ops::resize_bilinear(
+            let mut input: microflow::tensor::Tensor4D<_, 1, 224usize, 224usize, 3usize, 1> = microflow::ops::resize_bilinear(
                 input,
                 [0.0039f32],
                 [-128i8],

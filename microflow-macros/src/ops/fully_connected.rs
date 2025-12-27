@@ -137,7 +137,7 @@ impl<T: TokenQuantized> ToTokens for TokenFullyConnected<T> {
 
         let ts = quote! {
             const #weights_ident: #weights_type = #weights;
-            let input: microflow::tensor::Tensor2D<_, #(#output_shape),*, 1usize> =
+            let mut input: microflow::tensor::Tensor2D<_, #(#output_shape),*, 1usize> =
                 microflow::ops::fully_connected(
                     input #reshape,
                     &#weights_ident,
@@ -229,7 +229,7 @@ mod tests {
             layer.to_token_stream().to_string(),
             quote! {
                 const weights_0: microflow::tensor::Tensor2D<i8, 2usize, 3usize, 1usize> = #weights;
-                let input: microflow::tensor::Tensor2D<_, 1usize, 3usize, 1usize> =
+                let mut input: microflow::tensor::Tensor2D<_, 1usize, 3usize, 1usize> =
                     microflow::ops::fully_connected(
                         input,
                         &weights_0,

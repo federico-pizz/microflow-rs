@@ -171,7 +171,7 @@ pub fn model(args: TokenStream, item: TokenStream) -> TokenStream {
                 Self::predict_inner(input).dequantize()
             }
 
-            fn predict_inner(input: microflow::tensor::#input_tensor<#input_type, #(#input_shape),*, 1usize>) -> microflow::tensor::#output_tensor<#output_type, #(#output_shape),*, 1usize> {
+            fn predict_inner(mut input: microflow::tensor::#input_tensor<#input_type, #(#input_shape),*, 1usize>) -> microflow::tensor::#output_tensor<#output_type, #(#output_shape),*, 1usize> {
                 #layers
                 input
             }

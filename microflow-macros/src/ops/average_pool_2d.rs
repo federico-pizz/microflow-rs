@@ -91,7 +91,7 @@ impl<T: TokenQuantized> ToTokens for TokenAveragePool2D<T> {
         let (constants_0, constants_1) = self.constants;
 
         let ts = quote! {
-            let input: microflow::tensor::Tensor4D<_, #(#output_shape),*, 1usize> =
+            let mut input: microflow::tensor::Tensor4D<_, #(#output_shape),*, 1usize> =
                 microflow::ops::average_pool_2d(
                     input,
                     (nalgebra::Const::<#filter_shape_0>, nalgebra::Const::<#filter_shape_1>),
@@ -152,7 +152,7 @@ mod tests {
         assert_eq!(
             layer.to_token_stream().to_string(),
             quote! {
-                let input: microflow::tensor::Tensor4D<_, 1usize, 2usize, 3usize, 2usize, 1usize> =
+                let mut input: microflow::tensor::Tensor4D<_, 1usize, 2usize, 3usize, 2usize, 1usize> =
                     microflow::ops::average_pool_2d(
                         input,
                         (nalgebra::Const::<2usize>, nalgebra::Const::<3usize>),

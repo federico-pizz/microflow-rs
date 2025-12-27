@@ -26,6 +26,27 @@ pub fn softmax<T: Quantized, const ROWS: usize, const COLS: usize>(
     )
 }
 
+/// Performs the Softmax activation function in-place on the input tensor.
+///
+/// # Arguments
+/// * `input` - The mutable 2-dimensional input tensor to modify in place
+/// * `output_scale` - The scale of the resulting output tensor
+/// * `output_zero_point` - The zero point of the resulting output tensor
+///
+pub fn softmax_in_place<T: Quantized, const ROWS: usize, const COLS: usize>(
+    input: &mut Tensor2D<T, ROWS, COLS, 1>,
+    output_scale: [f32; 1],
+    output_zero_point: [T; 1],
+) {
+    let exp = input.buffer.map(|e| f32::from_subset(&e) * input.scale[0]);
+    let sum = exp.map(expf).sum();
+    input.buffer.zip_apply(&exp, |elem, e| {
+        *elem = activation::softmax(e, sum, output_scale[0], output_zero_point[0]);
+    });
+    input.scale = output_scale;
+    input.zero_point = output_zero_point;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -53,5 +74,12 @@ mod tests {
     #[test]
     fn softmax_layer() {
         assert_eq!(softmax(INPUT, OUTPUT_SCALE, OUTPUT_ZERO_POINT), OUTPUT);
+    }
+
+    #[test]
+    fn softmax_in_place_layer() {
+        let mut input = INPUT;
+        softmax_in_place(&mut input, OUTPUT_SCALE, OUTPUT_ZERO_POINT);
+        assert_eq!(input, OUTPUT);
     }
 }

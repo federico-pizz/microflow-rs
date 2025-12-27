@@ -131,7 +131,7 @@ impl<T: TokenQuantized> ToTokens for TokenDepthwiseConv2D<T> {
 
         let ts = quote! {
             const #weights_ident: #weights_type = #weights;
-            let input: microflow::tensor::Tensor4D<_, #(#output_shape),*, 1usize> =
+            let mut input: microflow::tensor::Tensor4D<_, #(#output_shape),*, 1usize> =
                 microflow::ops::depthwise_conv_2d(
                     input,
                     &#weights_ident,
@@ -218,7 +218,7 @@ mod tests {
             layer.to_token_stream().to_string(),
             quote! {
                 const weights_0: microflow::tensor::Tensor4D<i8, 1usize, 2usize, 3usize, 2usize, 2usize> = #weights;
-                let input: microflow::tensor::Tensor4D<_, 1usize, 2usize, 3usize, 2usize, 1usize> =
+                let mut input: microflow::tensor::Tensor4D<_, 1usize, 2usize, 3usize, 2usize, 1usize> =
                     microflow::ops::depthwise_conv_2d(
                         input,
                         &weights_0,

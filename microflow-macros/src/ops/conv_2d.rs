@@ -125,7 +125,7 @@ impl<T: TokenQuantized> ToTokens for TokenConv2D<T> {
 
         let ts = quote! {
             const #filters_ident: #filters_type = #filters;
-            let input: microflow::tensor::Tensor4D<_, #(#output_shape),*, 1usize> =
+            let mut input: microflow::tensor::Tensor4D<_, #(#output_shape),*, 1usize> =
                 microflow::ops::conv_2d(
                     input,
                     &#filters_ident,
@@ -217,7 +217,7 @@ mod tests {
             layer.to_token_stream().to_string(),
             quote! {
                 const filters_0: microflow::tensor::Tensor4D<i8, 2usize, 2usize, 3usize, 2usize, 2usize> = #filters;
-                let input: microflow::tensor::Tensor4D<_, 1usize, 2usize, 3usize, 2usize, 1usize> =
+                let mut input: microflow::tensor::Tensor4D<_, 1usize, 2usize, 3usize, 2usize, 1usize> =
                     microflow::ops::conv_2d(
                         input,
                         &filters_0,

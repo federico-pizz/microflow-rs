@@ -43,7 +43,7 @@ pub fn resize_bilinear<
         } else {
             r as f32 * INPUT_ROWS as f32 / OUTPUT_ROWS as f32
         };
-        
+
         let in_c = if options.half_pixel_centers {
             ((c as f32 + 0.5) * (INPUT_COLS as f32 / OUTPUT_COLS as f32)) - 0.5
         } else if options.align_corners && OUTPUT_COLS > 1 {
@@ -73,14 +73,14 @@ pub fn resize_bilinear<
             let p3 = f32::from_subset(&input.buffer[0][(r2, c1)][i]);
             let p4 = f32::from_subset(&input.buffer[0][(r2, c2)][i]);
 
-            // Perform the bilinear interpolation
-            let out = p1 * (1. - xr) * (1. - yr)
-                + p2 * xr * (1. - yr)
-                + p3 * (1. - xr) * yr
-                + p4 * xr * yr;
-            
-            // Requantize the output value
-            let requantized = roundf(constants.0 * out + constants.1);
+            // Perform the bilinear interpolation and requantize in one step
+            let requantized = roundf(
+                constants.0 * (p1 * (1. - xr) * (1. - yr)
+                             + p2 * xr * (1. - yr)
+                             + p3 * (1. - xr) * yr
+                             + p4 * xr * yr)
+                + constants.1
+            );
 
             // Validate for NaN/infinity and use safe conversion
             let clamped = if requantized.is_nan() || requantized.is_infinite() {

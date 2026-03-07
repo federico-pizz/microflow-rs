@@ -52,19 +52,19 @@ pub fn resize_bilinear<
             c as f32 * INPUT_COLS as f32 / OUTPUT_COLS as f32
         };
 
-        // Squeeze the coordinates to be within the input tensor's bounds
-        let in_r_squeezed = in_r.max(0.).min(INPUT_ROWS as f32 - 1.);
-        let in_c_squeezed = in_c.max(0.).min(INPUT_COLS as f32 - 1.);
+        // Clamp the coordinates to be within the input tensor's bounds
+        let in_r_clamped = in_r.max(0.).min(INPUT_ROWS as f32 - 1.);
+        let in_c_clamped = in_c.max(0.).min(INPUT_COLS as f32 - 1.);
 
         // Get the four nearest neighbors
-        let r1 = floorf(in_r_squeezed) as usize;
-        let c1 = floorf(in_c_squeezed) as usize;
+        let r1 = floorf(in_r_clamped) as usize;
+        let c1 = floorf(in_c_clamped) as usize;
         let r2 = (r1 + 1).min(INPUT_ROWS - 1);
         let c2 = (c1 + 1).min(INPUT_COLS - 1);
 
         // Calculate the interpolation weights
-        let yr = in_r_squeezed - r1 as f32;
-        let xr = in_c_squeezed - c1 as f32;
+        let yr = in_r_clamped - r1 as f32;
+        let xr = in_c_clamped - c1 as f32;
 
         let mut out_channels = [T::from_superset_unchecked(&0); INPUT_CHANS];
         for i in 0..INPUT_CHANS {
@@ -82,15 +82,7 @@ pub fn resize_bilinear<
             // Requantize the output value
             let requantized = roundf(constants.0 * out + constants.1);
 
-            // Validate for NaN/infinity and use safe conversion
-            let clamped = if requantized.is_nan() || requantized.is_infinite() {
-                0.0f32 // Default to zero for invalid results
-            } else {
-                requantized
-            };
-
-            // Use safe conversion with fallback to zero
-            out_channels[i] = T::from_superset(&clamped).unwrap_or_else(|| T::from_superset_unchecked(&0.0f32));
+            out_channels[i] = T::from_superset_unchecked(&requantized);
         }
         out_channels
     })];

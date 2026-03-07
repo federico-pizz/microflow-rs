@@ -6,15 +6,15 @@ use proc_macro2::TokenStream as TokenStream2;
 use quote::{quote, ToTokens};
 use simba::scalar::SupersetOf;
 
-/// Represents the tokenized version of the `ResizeBilinear` operator.
-pub(crate) struct TokenResizeBilinear<T: TokenQuantized> {
+/// Represents the tokenized version of the `ResizeNearestNeighbor` operator.
+pub(crate) struct TokenResizeNearestNeighbor<T: TokenQuantized> {
     pub(crate) output: TokenTensor4D<T>,
     pub(crate) align_corners: bool,
     pub(crate) half_pixel_centers: bool,
     pub(crate) constants: (f32, f32),
 }
 
-/// Parses the [`TokenResizeBilinear`] struct from the given operator.
+/// Parses the [`TokenResizeNearestNeighbor`] struct from the given operator.
 ///
 /// # Arguments
 /// * `operator` - The model operator as an [`Operator`].
@@ -34,17 +34,17 @@ pub(crate) fn parse(
     let input_type = tensors.get(inputs.get(0) as usize).type_();
     match input_type {
         TensorType::INT8 => {
-            Box::new(TokenResizeBilinear::<i8>::new(operator, tensors, buffers, index))
+            Box::new(TokenResizeNearestNeighbor::<i8>::new(operator, tensors, buffers, index))
         }
         TensorType::UINT8 => {
-            Box::new(TokenResizeBilinear::<u8>::new(operator, tensors, buffers, index))
+            Box::new(TokenResizeNearestNeighbor::<u8>::new(operator, tensors, buffers, index))
         }
         _ => unimplemented!(),
     }
 }
 
-impl<T: TokenQuantized> TokenResizeBilinear<T> {
-    /// Creates a new [`TokenResizeBilinear`] struct.
+impl<T: TokenQuantized> TokenResizeNearestNeighbor<T> {
+    /// Creates a new [`TokenResizeNearestNeighbor`] struct.
     pub(crate) fn new(
         operator: Operator,
         tensors: Vector<ForwardsUOffset<Tensor>>,
@@ -55,7 +55,7 @@ impl<T: TokenQuantized> TokenResizeBilinear<T> {
         let outputs = operator.outputs().unwrap();
 
         if inputs.len() != 2 {
-            panic!("ResizeBilinear operator expects 2 inputs");
+            panic!("ResizeNearestNeighbor operator expects 2 inputs");
         }
 
         let input_tensor = tensors.get(inputs.get(0) as usize);
@@ -63,7 +63,7 @@ impl<T: TokenQuantized> TokenResizeBilinear<T> {
         let output_tensor = tensors.get(outputs.get(0) as usize);
 
         let options = operator
-            .builtin_options_as_resize_bilinear_options()
+            .builtin_options_as_resize_nearest_neighbor_options()
             .unwrap();
 
         let input = TokenTensor4D::<T>::from_empty_tensor(input_tensor);
@@ -100,7 +100,7 @@ impl<T: TokenQuantized> TokenResizeBilinear<T> {
     }
 }
 
-impl<T: TokenQuantized> ToTokens for TokenResizeBilinear<T> {
+impl<T: TokenQuantized> ToTokens for TokenResizeNearestNeighbor<T> {
     fn to_tokens(&self, tokens: &mut TokenStream2) {
         let output_dims = &self.output.shape;
         let output_rows = output_dims[1];
@@ -114,19 +114,19 @@ impl<T: TokenQuantized> ToTokens for TokenResizeBilinear<T> {
         let half_pixel_centers = self.half_pixel_centers;
         let (constants_0, constants_1) = self.constants;
 
-        let resize_bilinear = quote! {
-            let input: microflow::tensor::Tensor4D<_, 1, #output_rows, #output_cols, #output_chans, 1> = microflow::ops::resize_bilinear(
+        let resize_nearest_neighbor = quote! {
+            let input: microflow::tensor::Tensor4D<_, 1, #output_rows, #output_cols, #output_chans, 1> = microflow::ops::resize_nearest_neighbor(
                 input,
                 [#(#output_scale),*],
                 [#(#output_zero_point),*],
-                microflow::ops::ResizeBilinearOptions {
+                microflow::ops::ResizeNearestNeighborOptions {
                     align_corners: #align_corners,
                     half_pixel_centers: #half_pixel_centers,
                 },
                 (#constants_0, #constants_1),
             );
         };
-        tokens.extend(resize_bilinear);
+        tokens.extend(resize_nearest_neighbor);
     }
 }
 
@@ -138,7 +138,7 @@ mod tests {
 
     #[test]
     fn test_to_tokens_i8() {
-        let op = TokenResizeBilinear::<i8> {
+        let op = TokenResizeNearestNeighbor::<i8> {
             output: TokenTensor4D {
                 buffer: TokenBuffer4D::new(),
                 shape: vec![1, 224, 224, 3],
@@ -151,11 +151,11 @@ mod tests {
         };
 
         let expected = quote! {
-            let input: microflow::tensor::Tensor4D<_, 1, 224usize, 224usize, 3usize, 1> = microflow::ops::resize_bilinear(
+            let input: microflow::tensor::Tensor4D<_, 1, 224usize, 224usize, 3usize, 1> = microflow::ops::resize_nearest_neighbor(
                 input,
                 [0.0039f32],
                 [-128i8],
-                microflow::ops::ResizeBilinearOptions {
+                microflow::ops::ResizeNearestNeighborOptions {
                     align_corners: false,
                     half_pixel_centers: false,
                 },

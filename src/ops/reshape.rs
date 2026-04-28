@@ -1,5 +1,6 @@
 /// Performs the Reshape operator.
 /// Returns the correspondig output tensor.
+#[inline(always)]
 pub fn reshape<InputT, OutputT>(input: InputT) -> OutputT
 where
     InputT: Into<OutputT>,

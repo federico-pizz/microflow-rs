@@ -45,6 +45,17 @@ pub fn softmax<T: Quantized>(input: f32, sum: f32, scale: f32, zero_point: T) ->
     quantize(expf(input) / sum, scale, zero_point)
 }
 
+/// Performs the Sigmoid activation function on a dequantized float value.
+///
+/// # Arguments
+/// * `input` - The floating-point dequantized input value
+/// * `scale` - The output quantization scale
+/// * `zero_point` - The output quantization zero point
+///
+pub fn sigmoid<T: Quantized>(input: f32, scale: f32, zero_point: T) -> T {
+    quantize(1.0 / (1.0 + expf(-input)), scale, zero_point)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

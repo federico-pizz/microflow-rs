@@ -26,6 +26,7 @@ pub struct AveragePool2DOptions {
 /// * `options` - Operator's options as an [`AveragePool2DOptions`] struct
 /// * `constants` - Constant values coming from the pre-processing phase
 ///
+#[inline(always)]
 pub fn average_pool_2d<
     T: Quantized,
     const INPUT_ROWS: usize,

@@ -25,6 +25,7 @@ pub struct DepthwiseConv2DOptions {
 /// * `options` - Operator's options as an [`DepthwiseConv2DOptions`] struct
 /// * `constants` - Constant values coming from the pre-processing phase
 ///
+#[inline(always)]
 pub fn depthwise_conv_2d<
     T: Quantized,
     const INPUT_ROWS: usize,

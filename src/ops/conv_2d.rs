@@ -25,6 +25,7 @@ pub struct Conv2DOptions {
 /// * `options` - Operator's options as an [`Conv2DOptions`] struct
 /// * `constants` - Constant values coming from the pre-processing phase
 ///
+#[inline(always)]
 pub fn conv_2d<
     T: Quantized,
     const INPUT_ROWS: usize,

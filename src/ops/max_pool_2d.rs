@@ -26,6 +26,7 @@ pub struct MaxPool2DOptions {
 /// * `options` - Operator's options as a [`MaxPool2DOptions`] struct
 /// * `constants` - Constant values coming from the pre-processing phase
 ///
+#[inline(always)]
 pub fn max_pool_2d<
     T: Quantized,
     const INPUT_ROWS: usize,

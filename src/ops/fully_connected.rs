@@ -21,6 +21,7 @@ pub struct FullyConnectedOptions {
 /// * `options` - Operator's options as an [`FullyConnectedOptions`] struct
 /// * `constants` - Constant values coming from the pre-processing phase
 ///
+#[inline(always)]
 pub fn fully_connected<
     T: Quantized,
     const INPUT_ROWS: usize,

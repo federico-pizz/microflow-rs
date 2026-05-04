@@ -12,6 +12,7 @@ mod resize_bilinear;
 mod resize_nearest_neighbor;
 mod sigmoid;
 mod softmax;
+mod split;
 mod transpose_conv_2d;
 
 pub use add::*;
@@ -28,4 +29,5 @@ pub use resize_bilinear::*;
 pub use resize_nearest_neighbor::*;
 pub use sigmoid::*;
 pub use softmax::*;
+pub use split::*;
 pub use transpose_conv_2d::*;

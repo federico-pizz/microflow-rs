@@ -1,10 +1,8 @@
-use core::array;
 use libm::roundf;
 
 use simba::scalar::SupersetOf;
 
 use crate::activation::{relu, relu6, FusedActivation};
-use crate::buffer::Buffer2D;
 use crate::quantize::Quantized;
 use crate::tensor::Tensor4D;
 
@@ -31,31 +29,38 @@ pub fn add<
     const COLS: usize,
     const CHANS: usize,
 >(
-    input1: Tensor4D<T, BATCHES, ROWS, COLS, CHANS, 1>,
+    mut input1: Tensor4D<T, BATCHES, ROWS, COLS, CHANS, 1>,
     input2: &Tensor4D<T, BATCHES, ROWS, COLS, CHANS, 1>,
     output_scale: [f32; 1],
     output_zero_point: [T; 1],
     options: AddOptions,
     constants: (f32, f32, f32),
 ) -> Tensor4D<T, BATCHES, ROWS, COLS, CHANS, 1> {
-    let output = array::from_fn(|b| {
-        Buffer2D::from_fn(|i, j| {
-            array::from_fn(|c| {
-                let a = f32::from_subset(&input1.buffer[b][(i, j)][c]);
-                let bv = f32::from_subset(&input2.buffer[b][(i, j)][c]);
-                // constants = (s1/s_out, s2/s_out, zp_out - s1/s_out*zp1 - s2/s_out*zp2)
-                let y = T::from_superset_unchecked(&roundf(
-                    constants.0 * a + constants.1 * bv + constants.2,
-                ));
-                match options.fused_activation {
-                    FusedActivation::None => y,
-                    FusedActivation::Relu => relu(y, output_zero_point[0]),
-                    FusedActivation::Relu6 => relu6(y, output_scale[0], output_zero_point[0]),
+    for b in 0..BATCHES {
+        for i in 0..ROWS {
+            for j in 0..COLS {
+                // Copy both cells before writing to avoid aliasing
+                let a_vals = input1.buffer[b][(i, j)];
+                let b_vals = input2.buffer[b][(i, j)];
+                for c in 0..CHANS {
+                    let a = f32::from_subset(&a_vals[c]);
+                    let bv = f32::from_subset(&b_vals[c]);
+                    // constants = (s1/s_out, s2/s_out, zp_out - s1/s_out*zp1 - s2/s_out*zp2)
+                    let y = T::from_superset_unchecked(&roundf(
+                        constants.0 * a + constants.1 * bv + constants.2,
+                    ));
+                    input1.buffer[b][(i, j)][c] = match options.fused_activation {
+                        FusedActivation::None => y,
+                        FusedActivation::Relu => relu(y, output_zero_point[0]),
+                        FusedActivation::Relu6 => relu6(y, output_scale[0], output_zero_point[0]),
+                    };
                 }
-            })
-        })
-    });
-    Tensor4D::new(output, output_scale, output_zero_point)
+            }
+        }
+    }
+    input1.scale = output_scale;
+    input1.zero_point = output_zero_point;
+    input1
 }
 
 #[cfg(test)]

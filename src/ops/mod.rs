@@ -1,5 +1,6 @@
 mod add;
 mod average_pool_2d;
+mod concat;
 mod conv_2d;
 mod depthwise_conv_2d;
 mod fully_connected;
@@ -15,6 +16,7 @@ mod transpose_conv_2d;
 
 pub use add::*;
 pub use average_pool_2d::*;
+pub use concat::*;
 pub use conv_2d::*;
 pub use depthwise_conv_2d::*;
 pub use fully_connected::*;

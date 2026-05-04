@@ -2,8 +2,6 @@ use crate::activation;
 use crate::quantize::Quantized;
 use crate::quantize::dequantize;
 use crate::tensor::Tensor4D;
-use crate::buffer::Buffer2D;
-use core::array;
 
 /// Performs the Sigmoid activation function as an operator on a quantized 4D tensor.
 /// Returns a 4-dimensional output tensor containing the result of the operation.
@@ -24,21 +22,27 @@ pub fn sigmoid<
     const COLS: usize,
     const CHANS: usize,
 >(
-    input: Tensor4D<T, BATCHES, ROWS, COLS, CHANS, 1>,
+    mut input: Tensor4D<T, BATCHES, ROWS, COLS, CHANS, 1>,
     output_scale: [f32; 1],
     output_zero_point: [T; 1],
 ) -> Tensor4D<T, BATCHES, ROWS, COLS, CHANS, 1> {
     let in_scale = input.scale[0];
     let in_zp = input.zero_point[0];
-    let output = array::from_fn(|b| {
-        Buffer2D::from_fn(|i, j| {
-            array::from_fn(|c| {
-                let x = dequantize(input.buffer[b][(i, j)][c], in_scale, in_zp);
-                activation::sigmoid(x, output_scale[0], output_zero_point[0])
-            })
-        })
-    });
-    Tensor4D::new(output, output_scale, output_zero_point)
+    for b in 0..BATCHES {
+        for i in 0..ROWS {
+            for j in 0..COLS {
+                let vals = input.buffer[b][(i, j)];
+                for c in 0..CHANS {
+                    let x = dequantize(vals[c], in_scale, in_zp);
+                    input.buffer[b][(i, j)][c] =
+                        activation::sigmoid(x, output_scale[0], output_zero_point[0]);
+                }
+            }
+        }
+    }
+    input.scale = output_scale;
+    input.zero_point = output_zero_point;
+    input
 }
 
 #[cfg(test)]

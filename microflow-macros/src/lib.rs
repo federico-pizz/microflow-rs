@@ -8,10 +8,11 @@ extern crate proc_macro;
 
 use proc_macro::TokenStream;
 use proc_macro_error::{abort_call_site, proc_macro_error};
+use std::collections::HashSet;
 use std::fs;
 
 use proc_macro2::TokenStream as TokenStream2;
-use quote::{quote, ToTokens};
+use quote::{format_ident, quote, ToTokens};
 use syn::{parse_macro_input, ItemStruct};
 
 use crate::tflite_flatbuffers::tflite::TensorType;
@@ -112,8 +113,34 @@ pub fn model(args: TokenStream, item: TokenStream) -> TokenStream {
     };
 
     let operators = subgraph.operators().unwrap();
+
+    // Phase 1: find tensor indices that must be saved (cloned) because they are consumed by a
+    // CONCATENATION op that is not the immediately-preceding computation step.
+    let mut tensors_to_save: HashSet<usize> = HashSet::new();
+    for operator in operators.iter() {
+        let code = BuiltinOperator(
+            model
+                .operator_codes()
+                .unwrap()
+                .get(operator.opcode_index() as usize)
+                .deprecated_builtin_code() as i32,
+        );
+        if code == BuiltinOperator::CONCATENATION {
+            let inputs = operator.inputs().unwrap();
+            for k in 0..inputs.len() {
+                tensors_to_save.insert(inputs.get(k) as usize);
+            }
+        }
+    }
+
+    // Phase 2: iterate operators, track the current tensor index, and emit code.
+    let input_idx = subgraph.inputs().unwrap().get(0) as usize;
+    let mut current_tensor_idx = input_idx;
     let mut layers = TokenStream2::new();
+
     for (index, operator) in operators.iter().enumerate() {
+        let output_idx = operator.outputs().unwrap().get(0) as usize;
+
         let layer: Box<dyn ToTokens> = match BuiltinOperator(
             model
                 .operator_codes()
@@ -132,11 +159,43 @@ pub fn model(args: TokenStream, item: TokenStream) -> TokenStream {
             BuiltinOperator::MAX_POOL_2D => max_pool_2d::parse(operator, tensors),
             BuiltinOperator::SOFTMAX => softmax::parse(operator, tensors),
             BuiltinOperator::RESHAPE => Box::new(reshape::parse(operator, tensors)),
-            BuiltinOperator::RESIZE_BILINEAR => resize_bilinear::parse(operator, tensors, buffers, index),
-            BuiltinOperator::RESIZE_NEAREST_NEIGHBOR => resize_nearest_neighbor::parse(operator, tensors, buffers, index),
+            BuiltinOperator::RESIZE_BILINEAR => {
+                resize_bilinear::parse(operator, tensors, buffers, index)
+            }
+            BuiltinOperator::RESIZE_NEAREST_NEIGHBOR => {
+                resize_nearest_neighbor::parse(operator, tensors, buffers, index)
+            }
+            BuiltinOperator::CONCATENATION => {
+                let input_type = tensors
+                    .get(operator.inputs().unwrap().get(0) as usize)
+                    .type_();
+                match input_type {
+                    TensorType::INT8 => Box::new(concat::parse::<i8>(
+                        operator,
+                        tensors,
+                        current_tensor_idx,
+                    )),
+                    TensorType::UINT8 => Box::new(concat::parse::<u8>(
+                        operator,
+                        tensors,
+                        current_tensor_idx,
+                    )),
+                    _ => abort_call_site!("unsupported tensor type for CONCATENATION"),
+                }
+            }
             unsupported_op => abort_call_site!("unsupported operator: {:?}", unsupported_op),
         };
-        layer.to_tokens(&mut layers)
+        layer.to_tokens(&mut layers);
+
+        // Advance the sequential tensor tracker to this op's output.
+        current_tensor_idx = output_idx;
+
+        // If this output will be consumed by a later CONCATENATION as a non-current tensor,
+        // emit a clone so it remains accessible after the next op moves `input`.
+        if tensors_to_save.contains(&output_idx) {
+            let ident = format_ident!("tensor_{}", output_idx);
+            quote! { let #ident = input.clone(); }.to_tokens(&mut layers);
+        }
     }
 
     let output = tensors.get(subgraph.outputs().unwrap().get(0) as usize);

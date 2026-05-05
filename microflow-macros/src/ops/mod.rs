@@ -10,6 +10,7 @@ pub(crate) mod leaky_relu;
 pub(crate) mod max_pool_2d;
 pub(crate) mod mul;
 pub(crate) mod reduce_mean;
+pub(crate) mod relu;
 pub(crate) mod reshape;
 pub(crate) mod resize_bilinear;
 pub(crate) mod resize_nearest_neighbor;

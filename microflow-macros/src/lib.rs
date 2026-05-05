@@ -323,6 +323,8 @@ fn model_from_tflite(buf: &[u8], item: &ItemStruct) -> TokenStream {
                     _ => abort_call_site!("unsupported tensor type for MUL"),
                 }
             }
+            BuiltinOperator::RELU => relu::parse_relu(operator, tensors),
+            BuiltinOperator::RELU6 => relu::parse_relu6(operator, tensors),
             BuiltinOperator::LOGISTIC => sigmoid::parse(operator, tensors),
             BuiltinOperator::TANH => tanh::parse(operator, tensors),
             BuiltinOperator::HARD_SWISH => hard_swish::parse(operator, tensors),

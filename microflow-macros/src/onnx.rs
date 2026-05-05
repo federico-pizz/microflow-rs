@@ -327,18 +327,34 @@ pub(crate) fn parse_onnx(buf: &[u8]) -> ParsedOnnx {
         .unwrap_or_else(|| abort_call_site!("cannot determine output shape"));
     if output_shape.len() == 1 { output_shape.insert(0, 1); }
 
-    // ── Phase 1: find tensors that need saving for Concat ───────────────────
-    let split_secondaries: std::collections::HashSet<String> = graph.node.iter()
+    // ── Phase 1a: find tensors that need saving for Concat/Add/Mul ───────────
+    let channel_split_secondaries: std::collections::HashSet<String> = graph.node.iter()
         .filter(|n| n.op_type == "Split")
         .flat_map(|n| n.output.iter().skip(1).cloned())
         .collect();
 
     let mut to_save: std::collections::HashSet<String> = std::collections::HashSet::new();
     for node in &graph.node {
-        if node.op_type == "Concat" {
+        if matches!(node.op_type.as_str(), "Concat" | "Add" | "Mul") {
             for inp in &node.input {
-                if !split_secondaries.contains(inp) {
+                if !channel_split_secondaries.contains(inp) {
                     to_save.insert(inp.clone());
+                }
+            }
+        }
+    }
+
+    // ── Phase 1b: fused-activation map ───────────────────────────────────────
+    // Maps a compute-op's output name → the activation that immediately follows it.
+    // Used so Conv/Gemm can emit FusedActivation::Relu/Relu6 instead of None.
+    let mut fused_activation_map: HashMap<String, &OnnxNode> = HashMap::new();
+    for (i, node) in graph.node.iter().enumerate() {
+        if matches!(node.op_type.as_str(), "Conv" | "ConvInteger" | "ConvTranspose" | "Gemm" | "MatMul") {
+            if let Some(next) = graph.node.get(i + 1) {
+                if matches!(next.op_type.as_str(), "Relu" | "Clip") {
+                    if let Some(out) = node.output.first() {
+                        fused_activation_map.insert(out.clone(), next);
+                    }
                 }
             }
         }
@@ -348,18 +364,27 @@ pub(crate) fn parse_onnx(buf: &[u8]) -> ParsedOnnx {
     let mut current_name = graph_in_name.clone();
     let mut layers: Vec<TokenStream2> = Vec::new();
     let mut op_idx = 0usize;
+    let mut skip_next = false;
 
     for node in &graph.node {
+        // A Relu/Clip that was fused into the preceding op is already handled.
+        if skip_next {
+            skip_next = false;
+            if !node.output.is_empty() {
+                current_name = node.output[0].clone();
+            }
+            continue;
+        }
+
         match node.op_type.as_str() {
             "QuantizeLinear" | "DequantizeLinear" => {
-                // Folded — advance current name
                 if !node.output.is_empty() {
                     current_name = node.output[0].clone();
                 }
                 continue;
             }
             "Relu" | "Clip" => {
-                // Fused into preceding op conceptually; just advance name
+                // Not fused (would have been handled by skip_next) — advance name.
                 if !node.output.is_empty() {
                     current_name = node.output[0].clone();
                 }
@@ -372,14 +397,26 @@ pub(crate) fn parse_onnx(buf: &[u8]) -> ParsedOnnx {
         let qin = quant_of(&current_name, &quant_map, &dq_src_map);
         let qout = quant_of(&out_name, &quant_map, &dq_src_map);
 
+        // Determine fused activation for ops that support it.
+        let fused_act = if let Some(act_node) = fused_activation_map.get(&out_name) {
+            skip_next = true;
+            fused_activation_from_node(act_node)
+        } else {
+            quote!(microflow::activation::FusedActivation::None)
+        };
+
         let layer_ts = match node.op_type.as_str() {
             "Conv" | "ConvInteger" => gen_conv(
                 node, &inits, &shape_map, &quant_map, &dq_src_map,
-                &current_name, &out_name, op_idx,
+                &current_name, &out_name, op_idx, &fused_act,
+            ),
+            "ConvTranspose" => gen_conv_transpose(
+                node, &inits, &shape_map, &quant_map, &dq_src_map,
+                &current_name, &out_name, op_idx, &fused_act,
             ),
             "Gemm" | "MatMul" => gen_gemm(
                 node, &inits, &shape_map, &quant_map, &dq_src_map,
-                &current_name, &out_name, op_idx,
+                &current_name, &out_name, op_idx, &fused_act,
             ),
             "AveragePool" | "GlobalAveragePool" => gen_avg_pool(
                 node, &shape_map, qin, qout, &out_name,
@@ -392,10 +429,16 @@ pub(crate) fn parse_onnx(buf: &[u8]) -> ParsedOnnx {
                 node, &quant_map, &dq_src_map, &shape_map,
                 &current_name, &out_name,
             ),
+            "Add" => gen_add(node, &quant_map, &dq_src_map, &shape_map, &current_name, &out_name),
+            "Mul" => gen_mul(node, &quant_map, &dq_src_map, &shape_map, &current_name, &out_name),
+            "Sigmoid" => gen_sigmoid(qout, &out_name, &shape_map),
+            "Tanh" => gen_tanh(qout, &out_name, &shape_map),
+            "HardSwish" => gen_hard_swish(qout, &out_name, &shape_map),
+            "LeakyRelu" => gen_leaky_relu(node, qout, &out_name, &shape_map),
+            "ReduceMean" => gen_reduce_mean(node, &shape_map, qin, qout, &out_name),
             "Split" => {
-                let ts = gen_split(node, &quant_map, &shape_map, &current_name);
+                let ts = gen_channel_split(node, &quant_map, &shape_map, &current_name);
                 layers.push(ts);
-                // primary output becomes new current_name
                 current_name = node.output[0].clone();
                 op_idx += 1;
                 continue;
@@ -405,7 +448,7 @@ pub(crate) fn parse_onnx(buf: &[u8]) -> ParsedOnnx {
 
         layers.push(layer_ts);
 
-        // Save a clone if this output is consumed by a later Concat
+        // Save a clone if this output is consumed by a later 2-input op.
         if to_save.contains(&out_name) {
             let var = name_to_ident(&out_name);
             layers.push(quote! { let #var = input.clone(); });
@@ -467,6 +510,7 @@ fn gen_conv(
     current_name: &str,
     out_name: &str,
     idx: usize,
+    fused_act: &TokenStream2,
 ) -> TokenStream2 {
     let groups = attr_i(&node.attribute, "group").unwrap_or(1) as usize;
     let strides = attr_ints(&node.attribute, "strides")
@@ -539,7 +583,7 @@ fn gen_conv(
                     input, &#weights_id,
                     [#(#out_scales),*], [#(#out_zps),*],
                     microflow::ops::DepthwiseConv2DOptions {
-                        fused_activation: microflow::activation::FusedActivation::None,
+                        fused_activation: #fused_act,
                         view_padding: #padding_ts,
                         strides: (#stride_h, #stride_w),
                     },
@@ -575,7 +619,7 @@ fn gen_conv(
                     input, &#filters_id,
                     [#(#out_scales),*], [#(#out_zps),*],
                     microflow::ops::Conv2DOptions {
-                        fused_activation: microflow::activation::FusedActivation::None,
+                        fused_activation: #fused_act,
                         view_padding: #padding_ts,
                         strides: (#stride_h, #stride_w),
                     },
@@ -594,6 +638,7 @@ fn gen_gemm(
     current_name: &str,
     out_name: &str,
     idx: usize,
+    fused_act: &TokenStream2,
 ) -> TokenStream2 {
     let w_name = &node.input[1];
     let w_src = dq_src.get(w_name).map(|s| s.as_str()).unwrap_or(w_name);
@@ -667,7 +712,7 @@ fn gen_gemm(
                 input #reshape_ts, &#weights_id,
                 [#(#out_scales),*], [#(#out_zps),*],
                 microflow::ops::FullyConnectedOptions {
-                    fused_activation: microflow::activation::FusedActivation::None,
+                    fused_activation: #fused_act,
                 },
                 (#c0_tok, #c1, #c2_tok, #c3)
             );
@@ -870,34 +915,41 @@ fn gen_concat(
     }
 }
 
-fn gen_split(
+fn gen_channel_split(
     node: &OnnxNode,
     _quant_map: &HashMap<String, Quant>,
     shape_map: &HashMap<String, Vec<usize>>,
     _current_name: &str,
 ) -> TokenStream2 {
-    if node.output.len() != 2 {
-        abort_call_site!("only 2-way Split is supported for ONNX (got {} outputs)", node.output.len());
-    }
+    let n = node.output.len();
+    assert!(
+        n >= 2 && n <= 4,
+        "only 2-, 3-, and 4-way Split are supported for ONNX (got {} outputs)",
+        n
+    );
     let axis = attr_i(&node.attribute, "axis").unwrap_or(-1);
     if axis != 3 && axis != -1 {
         abort_call_site!("only channel-axis Split is supported (axis={})", axis);
     }
 
-    let out1 = &node.output[0];
-    let out2 = &node.output[1];
-    let s1 = get_shape(out1, shape_map);
-    let s2 = get_shape(out2, shape_map);
-    let (b, r, c, ch1) = (s1[0], s1[1], s1[2], s1[3]);
-    let ch2 = s2[3];
-    let total = ch1 + ch2;
-    let saved_var = name_to_ident(out2);
+    let s0 = get_shape(&node.output[0], shape_map);
+    let (b, r, c) = (s0[0], s0[1], s0[2]);
+
+    let chan_sizes: Vec<usize> = node.output.iter().map(|o| get_shape(o, shape_map)[3]).collect();
+    let total: usize = chan_sizes.iter().sum();
+
+    let type_annotations: Vec<_> = chan_sizes.iter().map(|ch| {
+        quote! { microflow::tensor::Tensor4D<_, #b, #r, #c, #ch, 1usize> }
+    }).collect();
+
+    let saved_vars: Vec<_> = node.output[1..].iter().map(|o| name_to_ident(o)).collect();
+    let ch_tokens: Vec<_> = chan_sizes.iter().map(|ch| quote!(#ch)).collect();
+    let fn_name = format_ident!("channel_split_{}", n);
 
     quote! {
-        let (input, #saved_var): (
-            microflow::tensor::Tensor4D<_, #b, #r, #c, #ch1, 1usize>,
-            microflow::tensor::Tensor4D<_, #b, #r, #c, #ch2, 1usize>,
-        ) = microflow::ops::split_2::<_, #b, #r, #c, #total, #ch1, #ch2>(input);
+        let (input, #(#saved_vars),*): (
+            #(#type_annotations),*
+        ) = microflow::ops::#fn_name::<_, #b, #r, #c, #total, #(#ch_tokens),*>(input);
     }
 }
 
@@ -958,4 +1010,304 @@ fn read_bias(
         }
     }
     (vec![0i32; n], qin.scale[0] * qw.scale[0])
+}
+
+// ─── Fused activation helper ──────────────────────────────────────────────────
+
+/// Returns a TokenStream2 for the FusedActivation to emit given an activation node.
+/// Clip with min=0, max=6 maps to Relu6; any other Clip / Relu maps to Relu.
+fn fused_activation_from_node(node: &OnnxNode) -> TokenStream2 {
+    if node.op_type == "Clip" {
+        let min_val = attr_f(&node.attribute, "min").unwrap_or(0.0);
+        let max_val = attr_f(&node.attribute, "max").unwrap_or(f32::MAX);
+        if (min_val - 0.0).abs() < 1e-5 && (max_val - 6.0).abs() < 1e-3 {
+            return quote!(microflow::activation::FusedActivation::Relu6);
+        }
+    }
+    quote!(microflow::activation::FusedActivation::Relu)
+}
+
+fn attr_f(attrs: &[OnnxAttr], name: &str) -> Option<f32> {
+    attrs.iter().find(|a| a.name == name).map(|a| a.f)
+}
+
+// ─── New operator code generators ────────────────────────────────────────────
+
+fn gen_add(
+    node: &OnnxNode,
+    quant_map: &HashMap<String, Quant>,
+    dq_src: &HashMap<String, String>,
+    shape_map: &HashMap<String, Vec<usize>>,
+    current_name: &str,
+    out_name: &str,
+) -> TokenStream2 {
+    if node.input.len() != 2 {
+        abort_call_site!("only 2-input Add is supported (got {})", node.input.len());
+    }
+    let idx0 = &node.input[0];
+    let idx1 = &node.input[1];
+    let current_is_first = idx0 == current_name;
+    let saved_name = if current_is_first { idx1 } else { idx0 };
+    let saved_var = name_to_ident(saved_name);
+
+    let qt0 = quant_of(idx0, quant_map, dq_src);
+    let qt1 = quant_of(idx1, quant_map, dq_src);
+    let qout = quant_of(out_name, quant_map, dq_src);
+
+    let c0 = qt0.scale[0] / qout.scale[0];
+    let c1 = qt1.scale[0] / qout.scale[0];
+    let c2 = f32::from_subset(&qout.zero_point[0])
+        - c0 * f32::from_subset(&qt0.zero_point[0])
+        - c1 * f32::from_subset(&qt1.zero_point[0]);
+
+    let out_shape = get_shape(out_name, shape_map);
+    let out_scales = &qout.scale;
+    let out_zps = &qout.zero_point;
+
+    if current_is_first {
+        quote! {
+            let input: microflow::tensor::Tensor4D<_, #(#out_shape),*, 1usize> =
+                microflow::ops::add(input, &#saved_var,
+                    [#(#out_scales),*], [#(#out_zps),*],
+                    microflow::ops::AddOptions { fused_activation: microflow::activation::FusedActivation::None },
+                    (#c0, #c1, #c2));
+        }
+    } else {
+        quote! {
+            let input: microflow::tensor::Tensor4D<_, #(#out_shape),*, 1usize> =
+                microflow::ops::add(#saved_var, &input,
+                    [#(#out_scales),*], [#(#out_zps),*],
+                    microflow::ops::AddOptions { fused_activation: microflow::activation::FusedActivation::None },
+                    (#c0, #c1, #c2));
+        }
+    }
+}
+
+fn gen_mul(
+    node: &OnnxNode,
+    quant_map: &HashMap<String, Quant>,
+    dq_src: &HashMap<String, String>,
+    shape_map: &HashMap<String, Vec<usize>>,
+    current_name: &str,
+    out_name: &str,
+) -> TokenStream2 {
+    if node.input.len() != 2 {
+        abort_call_site!("only 2-input Mul is supported (got {})", node.input.len());
+    }
+    let idx0 = &node.input[0];
+    let idx1 = &node.input[1];
+    let current_is_first = idx0 == current_name;
+    let saved_name = if current_is_first { idx1 } else { idx0 };
+    let saved_var = name_to_ident(saved_name);
+
+    let qt0 = quant_of(idx0, quant_map, dq_src);
+    let qt1 = quant_of(idx1, quant_map, dq_src);
+    let qout = quant_of(out_name, quant_map, dq_src);
+
+    let c0 = qt0.scale[0] * qt1.scale[0] / qout.scale[0];
+    let zp0 = f32::from_subset(&qt0.zero_point[0]);
+    let zp1 = f32::from_subset(&qt1.zero_point[0]);
+    let d1 = c0 * zp0;
+    let d2 = c0 * zp1;
+    let c2 = f32::from_subset(&qout.zero_point[0]) + c0 * zp0 * zp1;
+
+    let out_shape = get_shape(out_name, shape_map);
+    let out_scales = &qout.scale;
+    let out_zps = &qout.zero_point;
+
+    if current_is_first {
+        quote! {
+            let input: microflow::tensor::Tensor4D<_, #(#out_shape),*, 1usize> =
+                microflow::ops::mul(input, &#saved_var,
+                    [#(#out_scales),*], [#(#out_zps),*],
+                    microflow::ops::MulOptions { fused_activation: microflow::activation::FusedActivation::None },
+                    (#c0, #d1, #d2, #c2));
+        }
+    } else {
+        quote! {
+            let input: microflow::tensor::Tensor4D<_, #(#out_shape),*, 1usize> =
+                microflow::ops::mul(#saved_var, &input,
+                    [#(#out_scales),*], [#(#out_zps),*],
+                    microflow::ops::MulOptions { fused_activation: microflow::activation::FusedActivation::None },
+                    (#c0, #d1, #d2, #c2));
+        }
+    }
+}
+
+fn gen_sigmoid(qout: &Quant, out_name: &str, shape_map: &HashMap<String, Vec<usize>>) -> TokenStream2 {
+    let out_shape = get_shape(out_name, shape_map);
+    let out_scales = &qout.scale;
+    let out_zps = &qout.zero_point;
+    quote! {
+        let input: microflow::tensor::Tensor4D<_, #(#out_shape),*, 1usize> =
+            microflow::ops::sigmoid(input, [#(#out_scales),*], [#(#out_zps),*]);
+    }
+}
+
+fn gen_tanh(qout: &Quant, out_name: &str, shape_map: &HashMap<String, Vec<usize>>) -> TokenStream2 {
+    let out_shape = get_shape(out_name, shape_map);
+    let out_scales = &qout.scale;
+    let out_zps = &qout.zero_point;
+    quote! {
+        let input: microflow::tensor::Tensor4D<_, #(#out_shape),*, 1usize> =
+            microflow::ops::tanh(input, [#(#out_scales),*], [#(#out_zps),*]);
+    }
+}
+
+fn gen_hard_swish(qout: &Quant, out_name: &str, shape_map: &HashMap<String, Vec<usize>>) -> TokenStream2 {
+    let out_shape = get_shape(out_name, shape_map);
+    let out_scales = &qout.scale;
+    let out_zps = &qout.zero_point;
+    quote! {
+        let input: microflow::tensor::Tensor4D<_, #(#out_shape),*, 1usize> =
+            microflow::ops::hard_swish(input, [#(#out_scales),*], [#(#out_zps),*]);
+    }
+}
+
+fn gen_leaky_relu(
+    node: &OnnxNode,
+    qout: &Quant,
+    out_name: &str,
+    shape_map: &HashMap<String, Vec<usize>>,
+) -> TokenStream2 {
+    let out_shape = get_shape(out_name, shape_map);
+    let out_scales = &qout.scale;
+    let out_zps = &qout.zero_point;
+    let alpha = attr_f(&node.attribute, "alpha").unwrap_or(0.01);
+    quote! {
+        let input: microflow::tensor::Tensor4D<_, #(#out_shape),*, 1usize> =
+            microflow::ops::leaky_relu(input, #alpha, [#(#out_scales),*], [#(#out_zps),*]);
+    }
+}
+
+fn gen_reduce_mean(
+    node: &OnnxNode,
+    shape_map: &HashMap<String, Vec<usize>>,
+    qin: &Quant,
+    qout: &Quant,
+    out_name: &str,
+) -> TokenStream2 {
+    // axes attribute: expect [1,2] (H,W in NHWC) or [2,3] (H,W in NCHW)
+    let axes = attr_ints(&node.attribute, "axes").map(|a| a.to_vec()).unwrap_or_default();
+    assert!(
+        axes == vec![1, 2] || axes == vec![2, 3],
+        "only H+W ReduceMean (axes=[1,2] or [2,3]) is supported, got {:?}",
+        axes
+    );
+
+    let out_shape = get_shape(out_name, shape_map);
+    // Infer spatial extent from output shape (shape should be [B,1,1,C] or similar)
+    // Use the axes to determine which dimensions were reduced.
+    // The in_shape rows/cols are recovered from the axes applied to out_shape context.
+    // We can't recover them from out_shape alone, so look up current_name's shape via out_shape.
+    // For simplicity, use constant factor from qin/qout and let R*C be inferred
+    // by noting that out_shape is [B,1,1,C] so the spatial reduction is total.
+    // We look for the reduced dimensions in the input via the shape_map.
+    //
+    // Since we don't have the current input name here, use a conservative estimate:
+    // c0 = in_scale / out_scale  (without the 1/R*C factor — caller must provide full c0)
+    // Actually we need R*C. The runtime function signature takes (c0, c1) where
+    // c0 = in_scale / (out_scale * R * C). We derive R*C from the shape_map if available,
+    // otherwise default to 1 (GlobalAveragePool-style where R*C is encoded in out_shape context).
+    //
+    // Best effort: look for an intermediate shape in shape_map that matches out_name prefix.
+    // For now compute without R*C and rely on shape_map lookup by examining node inputs.
+    let in_name = node.input.first().cloned().unwrap_or_default();
+    let in_shape = shape_map.get(&in_name).cloned().unwrap_or_else(|| out_shape.clone());
+    let (rows, cols) = if axes == vec![1, 2] {
+        (in_shape.get(1).copied().unwrap_or(1), in_shape.get(2).copied().unwrap_or(1))
+    } else {
+        (in_shape.get(2).copied().unwrap_or(1), in_shape.get(3).copied().unwrap_or(1))
+    };
+    let c0 = qin.scale[0] / (qout.scale[0] * (rows * cols) as f32);
+    let c1 = f32::from_subset(&qout.zero_point[0]);
+
+    let out_scales = &qout.scale;
+    let out_zps = &qout.zero_point;
+    quote! {
+        let input: microflow::tensor::Tensor4D<_, #(#out_shape),*, 1usize> =
+            microflow::ops::reduce_mean(
+                input,
+                [#(#out_scales),*], [#(#out_zps),*],
+                (#c0, #c1),
+            );
+    }
+}
+
+fn gen_conv_transpose(
+    node: &OnnxNode,
+    inits: &HashMap<String, OnnxTensor>,
+    shape_map: &HashMap<String, Vec<usize>>,
+    quant_map: &HashMap<String, Quant>,
+    dq_src: &HashMap<String, String>,
+    current_name: &str,
+    out_name: &str,
+    idx: usize,
+    fused_act: &TokenStream2,
+) -> TokenStream2 {
+    let strides = attr_ints(&node.attribute, "strides")
+        .map(|s| (s[0] as usize, s[1] as usize))
+        .unwrap_or((1, 1));
+    let (stride_h, stride_w) = strides;
+
+    // ONNX ConvTranspose weights: [in_ch, out_ch/groups, kH, kW]
+    let w_name = &node.input[1];
+    let w_src = dq_src.get(w_name).map(|s| s.as_str()).unwrap_or(w_name);
+    let w_init = inits.get(w_src)
+        .unwrap_or_else(|| abort_call_site!("ConvTranspose weight '{}' not found", w_src));
+    let w_shape = tensor_shape(w_init); // [in_ch, out_ch, kH, kW]
+    let (in_ch, out_ch, kh, kw) = (w_shape[0], w_shape[1], w_shape[2], w_shape[3]);
+
+    let qw = quant_of(w_src, quant_map, dq_src);
+    let qin = quant_of(current_name, quant_map, dq_src);
+    let qout = quant_of(out_name, quant_map, dq_src);
+
+    let w_i8: Vec<i8> = match w_init.data_type {
+        DT_INT8 => i8_data(w_init),
+        DT_FLOAT => {
+            let floats = float_data(w_init);
+            let (q, _) = quant_sym(&floats);
+            q
+        }
+        dt => abort_call_site!("unsupported ConvTranspose weight dtype {}", dt),
+    };
+
+    // Reorder ONNX [in_ch, out_ch, kH, kW] → microflow [out_ch, kH, kW, in_ch]
+    let w_buf: Vec<DMatrix<Vec<i8>>> = (0..out_ch).map(|oc| {
+        DMatrix::from_fn(kh, kw, |h, wc| {
+            (0..in_ch).map(|ic| {
+                w_i8[ic * (out_ch * kh * kw) + oc * (kh * kw) + h * kw + wc]
+            }).collect()
+        })
+    }).collect();
+
+    let w_scales: Vec<f32> = qw.scale.clone();
+    let w_zps: Vec<i8> = qw.zero_point.clone();
+    let n_quants = w_scales.len();
+    let w_token = TokenBuffer4D::from(w_buf);
+
+    let (bias_i32, bias_scale) = read_bias(node, inits, dq_src, qin, qw, out_ch);
+    let b_bias_tok = bias_constant_matrix(&bias_i32, bias_scale, qout, out_ch);
+    let b_scale_tok = scale_constant_conv(&qin.scale[0], &qw.scale, qout);
+
+    let out_shape = get_shape(out_name, shape_map);
+    let out_shape_ts = out_shape.iter().copied().collect::<Vec<_>>();
+    let out_scales = &qout.scale;
+    let out_zps = &qout.zero_point;
+
+    let filters_id = format_ident!("filters_{}", idx);
+    quote! {
+        const #filters_id: microflow::tensor::Tensor4D<i8, #out_ch, #kh, #kw, #in_ch, #n_quants> =
+            microflow::tensor::Tensor4D::new(#w_token, [#(#w_scales),*], [#(#w_zps),*]);
+        let input: microflow::tensor::Tensor4D<_, #(#out_shape_ts),*, 1usize> =
+            microflow::ops::transpose_conv_2d(
+                input, &#filters_id,
+                [#(#out_scales),*], [#(#out_zps),*],
+                microflow::ops::TransposeConv2DOptions {
+                    fused_activation: #fused_act,
+                    strides: (#stride_h, #stride_w),
+                },
+                (#b_bias_tok, #b_scale_tok)
+            );
+    }
 }

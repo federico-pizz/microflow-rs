@@ -171,8 +171,8 @@ fn model_from_tflite(buf: &[u8], item: &ItemStruct) -> TokenStream {
     let operators = subgraph.operators().unwrap();
 
     // Phase 1: find tensor indices that must be saved (cloned) because they are consumed by a
-    // CONCATENATION op, and identify SPLIT non-primary outputs (already named, no clone needed).
-    let mut split_secondary_outputs: HashSet<usize> = HashSet::new();
+    // CONCATENATION op, and identify channel-split non-primary outputs (already named, no clone needed).
+    let mut channel_split_secondary_outputs: HashSet<usize> = HashSet::new();
     for operator in operators.iter() {
         let code = BuiltinOperator(
             model
@@ -185,7 +185,7 @@ fn model_from_tflite(buf: &[u8], item: &ItemStruct) -> TokenStream {
             let outputs = operator.outputs().unwrap();
             // Primary output is outputs[0]; all others are saved by the destructuring, not cloned.
             for k in 1..outputs.len() {
-                split_secondary_outputs.insert(outputs.get(k) as usize);
+                channel_split_secondary_outputs.insert(outputs.get(k) as usize);
             }
         }
     }
@@ -199,12 +199,15 @@ fn model_from_tflite(buf: &[u8], item: &ItemStruct) -> TokenStream {
                 .get(operator.opcode_index() as usize)
                 .deprecated_builtin_code() as i32,
         );
-        if code == BuiltinOperator::CONCATENATION {
+        if code == BuiltinOperator::CONCATENATION
+            || code == BuiltinOperator::ADD
+            || code == BuiltinOperator::MUL
+        {
             let inputs = operator.inputs().unwrap();
             for k in 0..inputs.len() {
                 let idx = inputs.get(k) as usize;
-                // Skip tensors already bound by a SPLIT destructuring.
-                if !split_secondary_outputs.contains(&idx) {
+                // Skip tensors already bound by a channel-split destructuring.
+                if !channel_split_secondary_outputs.contains(&idx) {
                     tensors_to_save.insert(idx);
                 }
             }
@@ -227,14 +230,14 @@ fn model_from_tflite(buf: &[u8], item: &ItemStruct) -> TokenStream {
                 .deprecated_builtin_code() as i32,
         );
 
-        // SPLIT is handled specially: it produces multiple outputs and uses destructuring.
+        // TFLite SPLIT maps to channel_split: it produces multiple outputs and uses destructuring.
         if op_code == BuiltinOperator::SPLIT {
             let input_type = tensors
                 .get(operator.inputs().unwrap().get(1) as usize)
                 .type_();
             let layer: Box<dyn ToTokens> = match input_type {
-                TensorType::INT8 => Box::new(split::parse::<i8>(operator, tensors, buffers)),
-                TensorType::UINT8 => Box::new(split::parse::<u8>(operator, tensors, buffers)),
+                TensorType::INT8 => Box::new(channel_split::parse::<i8>(operator, tensors, buffers)),
+                TensorType::UINT8 => Box::new(channel_split::parse::<u8>(operator, tensors, buffers)),
                 _ => abort_call_site!("unsupported tensor type for SPLIT"),
             };
             layer.to_tokens(&mut layers);
@@ -283,6 +286,50 @@ fn model_from_tflite(buf: &[u8], item: &ItemStruct) -> TokenStream {
                     )),
                     _ => abort_call_site!("unsupported tensor type for CONCATENATION"),
                 }
+            }
+            BuiltinOperator::ADD => {
+                let input_type = tensors
+                    .get(operator.inputs().unwrap().get(0) as usize)
+                    .type_();
+                match input_type {
+                    TensorType::INT8 => Box::new(add::parse::<i8>(
+                        operator,
+                        tensors,
+                        current_tensor_idx,
+                    )),
+                    TensorType::UINT8 => Box::new(add::parse::<u8>(
+                        operator,
+                        tensors,
+                        current_tensor_idx,
+                    )),
+                    _ => abort_call_site!("unsupported tensor type for ADD"),
+                }
+            }
+            BuiltinOperator::MUL => {
+                let input_type = tensors
+                    .get(operator.inputs().unwrap().get(0) as usize)
+                    .type_();
+                match input_type {
+                    TensorType::INT8 => Box::new(mul::parse::<i8>(
+                        operator,
+                        tensors,
+                        current_tensor_idx,
+                    )),
+                    TensorType::UINT8 => Box::new(mul::parse::<u8>(
+                        operator,
+                        tensors,
+                        current_tensor_idx,
+                    )),
+                    _ => abort_call_site!("unsupported tensor type for MUL"),
+                }
+            }
+            BuiltinOperator::LOGISTIC => sigmoid::parse(operator, tensors),
+            BuiltinOperator::TANH => tanh::parse(operator, tensors),
+            BuiltinOperator::HARD_SWISH => hard_swish::parse(operator, tensors),
+            BuiltinOperator::LEAKY_RELU => leaky_relu::parse(operator, tensors, buffers),
+            BuiltinOperator::MEAN => reduce_mean::parse(operator, tensors, buffers),
+            BuiltinOperator::TRANSPOSE_CONV => {
+                transpose_conv_2d::parse(operator, tensors, buffers, index)
             }
             unsupported_op => abort_call_site!("unsupported operator: {:?}", unsupported_op),
         };

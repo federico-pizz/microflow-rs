@@ -56,6 +56,29 @@ pub fn sigmoid<T: Quantized>(input: f32, scale: f32, zero_point: T) -> T {
     quantize(1.0 / (1.0 + expf(-input)), scale, zero_point)
 }
 
+/// Performs the Tanh activation function on a dequantized float value.
+pub fn tanh<T: Quantized>(input: f32, scale: f32, zero_point: T) -> T {
+    use libm::tanhf;
+    quantize(tanhf(input), scale, zero_point)
+}
+
+/// Performs the HardSwish activation function: x * relu6(x + 3) / 6.
+pub fn hard_swish<T: Quantized>(input: f32, scale: f32, zero_point: T) -> T {
+    let y = if input <= -3.0 {
+        0.0
+    } else if input >= 3.0 {
+        input
+    } else {
+        input * (input + 3.0) / 6.0
+    };
+    quantize(y, scale, zero_point)
+}
+
+/// Performs the LeakyReLU activation function: alpha * x for x < 0, x otherwise.
+pub fn leaky_relu<T: Quantized>(input: f32, alpha: f32, scale: f32, zero_point: T) -> T {
+    quantize(if input >= 0.0 { input } else { alpha * input }, scale, zero_point)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

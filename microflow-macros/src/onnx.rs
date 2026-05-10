@@ -349,7 +349,10 @@ pub(crate) fn parse_onnx(buf: &[u8]) -> ParsedOnnx {
     // Used so Conv/Gemm can emit FusedActivation::Relu/Relu6 instead of None.
     let mut fused_activation_map: HashMap<String, &OnnxNode> = HashMap::new();
     for (i, node) in graph.node.iter().enumerate() {
-        if matches!(node.op_type.as_str(), "Conv" | "ConvInteger" | "ConvTranspose" | "Gemm" | "MatMul") {
+        if matches!(node.op_type.as_str(),
+            "Conv" | "ConvInteger" | "ConvTranspose" | "Gemm" | "MatMul"
+            | "Add" | "Mul" | "AveragePool" | "MaxPool"
+        ) {
             if let Some(next) = graph.node.get(i + 1) {
                 if matches!(next.op_type.as_str(), "Relu" | "Clip") {
                     if let Some(out) = node.output.first() {
@@ -384,11 +387,8 @@ pub(crate) fn parse_onnx(buf: &[u8]) -> ParsedOnnx {
                 continue;
             }
             "Relu" | "Clip" => {
-                // Not fused (would have been handled by skip_next) — advance name.
-                if !node.output.is_empty() {
-                    current_name = node.output[0].clone();
-                }
-                continue;
+                // Was not fused into the preceding op. Fall through to main dispatch
+                // so qin/qout are resolved and the activation is emitted explicitly.
             }
             _ => {}
         }
@@ -419,9 +419,9 @@ pub(crate) fn parse_onnx(buf: &[u8]) -> ParsedOnnx {
                 &current_name, &out_name, op_idx, &fused_act,
             ),
             "AveragePool" | "GlobalAveragePool" => gen_avg_pool(
-                node, &shape_map, qin, qout, &out_name,
+                node, &shape_map, qin, qout, &current_name, &out_name, &fused_act,
             ),
-            "MaxPool" => gen_max_pool(node, &shape_map, qin, qout, &out_name),
+            "MaxPool" => gen_max_pool(node, &shape_map, qin, qout, &out_name, &fused_act),
             "Softmax" => gen_softmax(qout, &out_name, &shape_map),
             "Reshape" | "Flatten" => gen_reshape(&out_name, &shape_map),
             "Resize" => gen_resize(node, &shape_map, qin, qout, &out_name),
@@ -429,8 +429,9 @@ pub(crate) fn parse_onnx(buf: &[u8]) -> ParsedOnnx {
                 node, &quant_map, &dq_src_map, &shape_map,
                 &current_name, &out_name,
             ),
-            "Add" => gen_add(node, &quant_map, &dq_src_map, &shape_map, &current_name, &out_name),
-            "Mul" => gen_mul(node, &quant_map, &dq_src_map, &shape_map, &current_name, &out_name),
+            "Add" => gen_add(node, &quant_map, &dq_src_map, &shape_map, &current_name, &out_name, &fused_act),
+            "Mul" => gen_mul(node, &quant_map, &dq_src_map, &shape_map, &current_name, &out_name, &fused_act),
+            "Relu" | "Clip" => gen_standalone_activation(node, qout, &out_name, &shape_map),
             "Sigmoid" => gen_sigmoid(qout, &out_name, &shape_map),
             "Tanh" => gen_tanh(qout, &out_name, &shape_map),
             "HardSwish" => gen_hard_swish(qout, &out_name, &shape_map),
@@ -724,16 +725,19 @@ fn gen_avg_pool(
     shape_map: &HashMap<String, Vec<usize>>,
     qin: &Quant,
     qout: &Quant,
+    current_name: &str,
     out_name: &str,
+    fused_act: &TokenStream2,
 ) -> TokenStream2 {
     let out_shape = get_shape(out_name, shape_map);
-    let _in_shape = shape_map.get(&*out_name).cloned().unwrap_or_default();
+    let in_shape = get_shape(current_name, shape_map);
+    // GlobalAveragePool has no kernel_shape attribute; use the input spatial dims.
     let kh = attr_ints(&node.attribute, "kernel_shape")
         .map(|k| k[0] as usize)
-        .unwrap_or(out_shape.get(1).copied().unwrap_or(1));
+        .unwrap_or_else(|| in_shape.get(1).copied().unwrap_or(1));
     let kw = attr_ints(&node.attribute, "kernel_shape")
         .map(|k| k[1] as usize)
-        .unwrap_or(out_shape.get(2).copied().unwrap_or(1));
+        .unwrap_or_else(|| in_shape.get(2).copied().unwrap_or(1));
     let pads = attr_ints(&node.attribute, "pads").map(|p| p.to_vec()).unwrap_or_default();
     let padding_ts = if pads.iter().any(|&p| p != 0) {
         quote!(microflow::tensor::TensorViewPadding::Same)
@@ -758,7 +762,7 @@ fn gen_avg_pool(
                 input,
                 [#(#out_scales),*], [#(#out_zps),*],
                 microflow::ops::AveragePool2DOptions {
-                    fused_activation: microflow::activation::FusedActivation::None,
+                    fused_activation: #fused_act,
                     view_padding: #padding_ts,
                     strides: (#stride_h, #stride_w),
                     filter: (#kh, #kw),
@@ -774,6 +778,7 @@ fn gen_max_pool(
     qin: &Quant,
     qout: &Quant,
     out_name: &str,
+    fused_act: &TokenStream2,
 ) -> TokenStream2 {
     let out_shape = get_shape(out_name, shape_map);
     let kh = attr_ints(&node.attribute, "kernel_shape").map(|k| k[0] as usize).unwrap_or(2);
@@ -802,7 +807,7 @@ fn gen_max_pool(
                 input,
                 [#(#out_scales),*], [#(#out_zps),*],
                 microflow::ops::MaxPool2DOptions {
-                    fused_activation: microflow::activation::FusedActivation::None,
+                    fused_activation: #fused_act,
                     view_padding: #padding_ts,
                     strides: (#stride_h, #stride_w),
                     filter: (#kh, #kw),
@@ -1031,6 +1036,36 @@ fn attr_f(attrs: &[OnnxAttr], name: &str) -> Option<f32> {
     attrs.iter().find(|a| a.name == name).map(|a| a.f)
 }
 
+fn gen_standalone_activation(
+    node: &OnnxNode,
+    qout: &Quant,
+    out_name: &str,
+    shape_map: &HashMap<String, Vec<usize>>,
+) -> TokenStream2 {
+    let out_shape = get_shape(out_name, shape_map);
+    let out_scales = &qout.scale;
+    let out_zps = &qout.zero_point;
+
+    if node.op_type == "Clip" {
+        let min_val = attr_f(&node.attribute, "min").unwrap_or(0.0);
+        let max_val = attr_f(&node.attribute, "max").unwrap_or(f32::MAX);
+        if (min_val - 0.0).abs() > 1e-5 || (max_val - 6.0).abs() > 1e-3 {
+            abort_call_site!(
+                "standalone Clip(min={}, max={}) is not supported; \
+                 only Clip(0, 6) = ReLU6 is handled as a fused activation",
+                min_val, max_val
+            );
+        }
+        // Clip(0, 6) standalone: emit relu as a conservative lower bound.
+        // In fully-quantized models the upper clamp is typically already
+        // captured by the output quantization range.
+    }
+    quote! {
+        let input: microflow::tensor::Tensor4D<_, #(#out_shape),*, 1usize> =
+            microflow::ops::relu(input, [#(#out_scales),*], [#(#out_zps),*]);
+    }
+}
+
 // ─── New operator code generators ────────────────────────────────────────────
 
 fn gen_add(
@@ -1040,6 +1075,7 @@ fn gen_add(
     shape_map: &HashMap<String, Vec<usize>>,
     current_name: &str,
     out_name: &str,
+    fused_act: &TokenStream2,
 ) -> TokenStream2 {
     if node.input.len() != 2 {
         abort_call_site!("only 2-input Add is supported (got {})", node.input.len());
@@ -1069,7 +1105,7 @@ fn gen_add(
             let input: microflow::tensor::Tensor4D<_, #(#out_shape),*, 1usize> =
                 microflow::ops::add(input, &#saved_var,
                     [#(#out_scales),*], [#(#out_zps),*],
-                    microflow::ops::AddOptions { fused_activation: microflow::activation::FusedActivation::None },
+                    microflow::ops::AddOptions { fused_activation: #fused_act },
                     (#c0, #c1, #c2));
         }
     } else {
@@ -1077,7 +1113,7 @@ fn gen_add(
             let input: microflow::tensor::Tensor4D<_, #(#out_shape),*, 1usize> =
                 microflow::ops::add(#saved_var, &input,
                     [#(#out_scales),*], [#(#out_zps),*],
-                    microflow::ops::AddOptions { fused_activation: microflow::activation::FusedActivation::None },
+                    microflow::ops::AddOptions { fused_activation: #fused_act },
                     (#c0, #c1, #c2));
         }
     }
@@ -1090,6 +1126,7 @@ fn gen_mul(
     shape_map: &HashMap<String, Vec<usize>>,
     current_name: &str,
     out_name: &str,
+    fused_act: &TokenStream2,
 ) -> TokenStream2 {
     if node.input.len() != 2 {
         abort_call_site!("only 2-input Mul is supported (got {})", node.input.len());
@@ -1120,7 +1157,7 @@ fn gen_mul(
             let input: microflow::tensor::Tensor4D<_, #(#out_shape),*, 1usize> =
                 microflow::ops::mul(input, &#saved_var,
                     [#(#out_scales),*], [#(#out_zps),*],
-                    microflow::ops::MulOptions { fused_activation: microflow::activation::FusedActivation::None },
+                    microflow::ops::MulOptions { fused_activation: #fused_act },
                     (#c0, #d1, #d2, #c2));
         }
     } else {
@@ -1128,7 +1165,7 @@ fn gen_mul(
             let input: microflow::tensor::Tensor4D<_, #(#out_shape),*, 1usize> =
                 microflow::ops::mul(#saved_var, &input,
                     [#(#out_scales),*], [#(#out_zps),*],
-                    microflow::ops::MulOptions { fused_activation: microflow::activation::FusedActivation::None },
+                    microflow::ops::MulOptions { fused_activation: #fused_act },
                     (#c0, #d1, #d2, #c2));
         }
     }

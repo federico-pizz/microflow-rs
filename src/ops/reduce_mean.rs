@@ -37,6 +37,7 @@ pub fn reduce_mean<
     let n = (INPUT_ROWS * INPUT_COLS) as i32;
     let output: [Buffer2D<[T; INPUT_CHANS], 1, 1>; BATCHES] = array::from_fn(|b| {
         Buffer2D::from_fn(|_, _| {
+            let n_times_zp = n * input_zp;
             array::from_fn(|c| {
                 // Accumulate integer sum of raw quantized values for this channel
                 let sum = (0..INPUT_ROWS).fold(0i32, |acc, r| {
@@ -47,7 +48,7 @@ pub fn reduce_mean<
                 // Subtract n*input_zp to convert sum-of-quantized to sum-of-dequantized (without scale)
                 // constants.0 = input_scale / (output_scale * n), constants.1 = f32(output_zero_point)
                 T::from_superset_unchecked(&roundf(
-                    constants.0 * (sum - n * input_zp) as f32 + constants.1,
+                    constants.0 * (sum - n_times_zp) as f32 + constants.1,
                 ))
             })
         })

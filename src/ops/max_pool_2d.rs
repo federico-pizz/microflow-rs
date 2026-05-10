@@ -6,7 +6,7 @@ use simba::scalar::SupersetOf;
 
 use crate::activation::{relu, relu6, FusedActivation};
 use crate::buffer::Buffer2D;
-use crate::quantize::Quantized;
+use crate::quantize::{quantize, Quantized};
 use crate::tensor::{Tensor4D, TensorView, TensorViewPadding};
 
 pub struct MaxPool2DOptions {
@@ -44,6 +44,7 @@ pub fn max_pool_2d<
     options: MaxPool2DOptions,
     constants: (f32, f32),
 ) -> Tensor4D<T, 1, OUTPUT_ROWS, OUTPUT_COLS, INPUT_CHANS, 1> {
+    let relu6_max = quantize(6., output_scale[0], output_zero_point[0]);
     let output = [Buffer2D::from_fn(|i, j| {
         // Extract the view using the view extraction algorithm
         let view: TensorView<T, FILTER_ROWS, FILTER_COLS, INPUT_CHANS> =
@@ -62,7 +63,7 @@ pub fn max_pool_2d<
             match options.fused_activation {
                 FusedActivation::None => y,
                 FusedActivation::Relu => relu(y, output_zero_point[0]),
-                FusedActivation::Relu6 => relu6(y, output_scale[0], output_zero_point[0]),
+                FusedActivation::Relu6 => relu6(y, output_zero_point[0], relu6_max),
             }
         })
     })];

@@ -5,7 +5,7 @@ use simba::scalar::SupersetOf;
 
 use crate::activation::{relu, relu6, FusedActivation};
 use crate::buffer::Buffer2D;
-use crate::quantize::Quantized;
+use crate::quantize::{quantize, Quantized};
 use crate::tensor::{Tensor4D, TensorView, TensorViewPadding};
 
 pub struct Conv2DOptions {
@@ -48,13 +48,19 @@ pub fn conv_2d<
         Buffer2D<f32, FILTERS_QUANTS, 1>,
     ),
 ) -> Tensor4D<T, 1, OUTPUT_ROWS, OUTPUT_COLS, FILTERS_BATCHES, 1> {
+    // Precompute values that are invariant across all output positions and filter batches
+    let relu6_max = quantize(6., output_scale[0], output_zero_point[0]);
+    let input_zero_point = i32::from_subset(&input.zero_point[0]);
     let output = [Buffer2D::from_fn(|i, j| {
         // Extract the view using the view extraction algorithm
         let view: TensorView<T, FILTERS_ROWS, FILTERS_COLS, INPUT_CHANS> =
             input.view((i, j), 0, options.view_padding, options.strides);
+        // Compute the view element sum once; it is shared across all filter batches
+        let view_sum = view.buffer.fold(0i32, |acc, a| {
+            acc + a.iter().fold(0i32, |acc, e| acc + i32::from_subset(e))
+        });
         // Perform the convolution for each filter batch
         array::from_fn(|b| {
-            let input_zero_point = i32::from_subset(&input.zero_point[0]);
             let filters_zero_point = i32::from_subset(
                 &filters
                     .zero_point
@@ -71,10 +77,8 @@ pub fn conv_2d<
                         .map(|(e1, e2)| i32::from_subset(e1) * i32::from_subset(e2))
                         .sum::<i32>()
                 }),
-                // Perform the 3-dimensional component-sum of the view
-                view.buffer.fold(0i32, |acc, a| {
-                    acc + a.iter().fold(0i32, |acc, e| acc + i32::from_subset(e))
-                }) * filters_zero_point,
+                // Use the hoisted view sum; only multiply by the per-batch filter zero point
+                view_sum * filters_zero_point,
             );
             // Elaborate the constants
             let constants = (
@@ -101,7 +105,7 @@ pub fn conv_2d<
             match options.fused_activation {
                 FusedActivation::None => y,
                 FusedActivation::Relu => relu(y, output_zero_point[0]),
-                FusedActivation::Relu6 => relu6(y, output_scale[0], output_zero_point[0]),
+                FusedActivation::Relu6 => relu6(y, output_zero_point[0], relu6_max),
             }
         })
     })];

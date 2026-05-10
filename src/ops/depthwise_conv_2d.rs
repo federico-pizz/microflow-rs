@@ -5,7 +5,7 @@ use simba::scalar::SupersetOf;
 
 use crate::activation::{relu, relu6, FusedActivation};
 use crate::buffer::Buffer2D;
-use crate::quantize::Quantized;
+use crate::quantize::{quantize, Quantized};
 use crate::tensor::{Tensor4D, TensorView, TensorViewPadding};
 
 pub struct DepthwiseConv2DOptions {
@@ -48,13 +48,15 @@ pub fn depthwise_conv_2d<
         Buffer2D<f32, WEIGHTS_QUANTS, 1>,
     ),
 ) -> Tensor4D<T, 1, OUTPUT_ROWS, OUTPUT_COLS, WEIGHTS_CHANS, 1> {
+    // Precompute values that are invariant across all output positions and channels
+    let relu6_max = quantize(6., output_scale[0], output_zero_point[0]);
+    let input_zero_point = i32::from_subset(&input.zero_point[0]);
     let output = [Buffer2D::from_fn(|i, j| {
         // Extract the view using the view extraction algorithm
         let view: TensorView<T, WEIGHTS_ROWS, WEIGHTS_COLS, INPUT_CHANS> =
             input.view((i, j), 0, options.view_padding, options.strides);
         // Perform the convolution for each input channel
         array::from_fn(|c| {
-            let input_zero_point = i32::from_subset(&input.zero_point[0]);
             let weights_zero_point = i32::from_subset(
                 &weights
                     .zero_point
@@ -62,17 +64,14 @@ pub fn depthwise_conv_2d<
                     .copied()
                     .unwrap_or(weights.zero_point[0]),
             );
-            let x = (
-                // Perform the dot product between the input region and the weights
-                view.buffer.zip_fold(&weights.buffer[0], 0i32, |acc, v, w| {
-                    acc + i32::from_subset(&v.get(c).copied().unwrap_or(v[0]))
-                        * i32::from_subset(&w[c])
-                }),
-                // Perform the 2-dimensional component-sum of the view for the given channel
-                view.buffer.fold(0i32, |acc, a| {
-                    acc + i32::from_subset(&a.get(c).copied().unwrap_or(a[0]))
-                }) * weights_zero_point,
-            );
+            // Single pass: accumulate MAC and per-channel view sum simultaneously
+            let (mac, view_sum_c) =
+                view.buffer
+                    .zip_fold(&weights.buffer[0], (0i32, 0i32), |acc, v, w| {
+                        let v_c = i32::from_subset(&v.get(c).copied().unwrap_or(v[0]));
+                        (acc.0 + v_c * i32::from_subset(&w[c]), acc.1 + v_c)
+                    });
+            let x = (mac, view_sum_c * weights_zero_point);
             // Elaborate the constants
             let constants = (
                 constants.0,
@@ -98,7 +97,7 @@ pub fn depthwise_conv_2d<
             match options.fused_activation {
                 FusedActivation::None => y,
                 FusedActivation::Relu => relu(y, output_zero_point[0]),
-                FusedActivation::Relu6 => relu6(y, output_scale[0], output_zero_point[0]),
+                FusedActivation::Relu6 => relu6(y, output_zero_point[0], relu6_max),
             }
         })
     })];

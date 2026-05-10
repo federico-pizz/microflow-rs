@@ -3,7 +3,7 @@ use libm::roundf;
 use simba::scalar::SupersetOf;
 
 use crate::activation::{relu, relu6, FusedActivation};
-use crate::quantize::Quantized;
+use crate::quantize::{quantize, Quantized};
 use crate::tensor::Tensor4D;
 
 pub struct MulOptions {
@@ -40,6 +40,7 @@ pub fn mul<
     options: MulOptions,
     constants: (f32, f32, f32, f32),
 ) -> Tensor4D<T, BATCHES, ROWS, COLS, CHANS, 1> {
+    let relu6_max = quantize(6., output_scale[0], output_zero_point[0]);
     for b in 0..BATCHES {
         for i in 0..ROWS {
             for j in 0..COLS {
@@ -57,7 +58,7 @@ pub fn mul<
                     input1.buffer[b][(i, j)][c] = match options.fused_activation {
                         FusedActivation::None => y,
                         FusedActivation::Relu => relu(y, output_zero_point[0]),
-                        FusedActivation::Relu6 => relu6(y, output_scale[0], output_zero_point[0]),
+                        FusedActivation::Relu6 => relu6(y, output_zero_point[0], relu6_max),
                     };
                 }
             }

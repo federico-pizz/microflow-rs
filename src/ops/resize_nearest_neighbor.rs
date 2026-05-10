@@ -1,3 +1,4 @@
+use core::array;
 use crate::buffer::Buffer2D;
 use crate::quantize::Quantized;
 use crate::tensor::Tensor4D;
@@ -51,28 +52,16 @@ pub fn resize_nearest_neighbor<
             floorf(c as f32 * INPUT_COLS as f32 / OUTPUT_COLS as f32) as usize
         };
 
-        // Ensure indices are within bounds
+        // Clamp indices to valid input bounds
         let nearest_r = in_r.min(INPUT_ROWS.saturating_sub(1));
         let nearest_c = in_c.min(INPUT_COLS.saturating_sub(1));
 
-        let mut out_channels = [T::from_superset_unchecked(&0); INPUT_CHANS];
-        for i in 0..INPUT_CHANS {
+        // constants.0 and constants.1 are finite by construction; p is an integer
+        // cast to f32, so the product is always finite — no NaN/inf guard needed.
+        array::from_fn(|i| {
             let p = f32::from_subset(&input.buffer[0][(nearest_r, nearest_c)][i]);
-
-            // Requantize the output value
-            let requantized = roundf(constants.0 * p + constants.1);
-
-            // Validate for NaN/infinity and use safe conversion
-            let clamped = if requantized.is_nan() || requantized.is_infinite() {
-                0.0f32 // Default to zero for invalid results
-            } else {
-                requantized
-            };
-
-            // Use safe conversion with fallback to zero
-            out_channels[i] = T::from_superset(&clamped).unwrap_or_else(|| T::from_superset_unchecked(&0.0f32));
-        }
-        out_channels
+            T::from_superset_unchecked(&roundf(constants.0 * p + constants.1))
+        })
     })];
     Tensor4D::new(output, output_scale, output_zero_point)
 }

@@ -3,7 +3,7 @@ use simba::scalar::SupersetOf;
 
 use crate::activation::{relu, relu6, FusedActivation};
 use crate::buffer::Buffer2D;
-use crate::quantize::Quantized;
+use crate::quantize::{quantize, Quantized};
 use crate::tensor::Tensor2D;
 
 pub struct FullyConnectedOptions {
@@ -40,6 +40,7 @@ pub fn fully_connected<
         i32,
     ),
 ) -> Tensor2D<T, INPUT_ROWS, WEIGHTS_COLS, 1> {
+    let relu6_max = quantize(6., output_scale[0], output_zero_point[0]);
     let x: (
         Buffer2D<i32, INPUT_ROWS, WEIGHTS_COLS>,
         Buffer2D<i32, INPUT_ROWS, 1>,
@@ -76,7 +77,7 @@ pub fn fully_connected<
         match options.fused_activation {
             FusedActivation::None => y,
             FusedActivation::Relu => relu(y, output_zero_point[0]),
-            FusedActivation::Relu6 => relu6(y, output_scale[0], output_zero_point[0]),
+            FusedActivation::Relu6 => relu6(y, output_zero_point[0], relu6_max),
         }
     });
     Tensor2D::new(output, output_scale, output_zero_point)

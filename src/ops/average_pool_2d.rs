@@ -6,7 +6,7 @@ use simba::scalar::SupersetOf;
 
 use crate::activation::{relu, relu6, FusedActivation};
 use crate::buffer::Buffer2D;
-use crate::quantize::Quantized;
+use crate::quantize::{quantize, Quantized};
 use crate::tensor::{Tensor4D, TensorView, TensorViewPadding};
 
 pub struct AveragePool2DOptions {
@@ -44,13 +44,16 @@ pub fn average_pool_2d<
     options: AveragePool2DOptions,
     constants: (f32, f32),
 ) -> Tensor4D<T, 1, OUTPUT_ROWS, OUTPUT_COLS, INPUT_CHANS, 1> {
+    let relu6_max = quantize(6., output_scale[0], output_zero_point[0]);
     let output = [Buffer2D::from_fn(|i, j| {
         // Extract the view using the view extraction algorithm
         let view: TensorView<T, FILTER_ROWS, FILTER_COLS, INPUT_CHANS> =
             input.view((i, j), 0, options.view_padding, options.strides);
+        // view.len is constant across all channels for this output position
+        let view_reciprocal = 1. / view.len as f32;
         // Compute the average pooling for each channel
         array::from_fn(|c| {
-            let x = 1. / view.len as f32
+            let x = view_reciprocal
                 * view
                     .buffer
                     .fold(0i32, |acc, a| acc + i32::from_subset(&a[c])) as f32;
@@ -59,7 +62,7 @@ pub fn average_pool_2d<
             match options.fused_activation {
                 FusedActivation::None => y,
                 FusedActivation::Relu => relu(y, output_zero_point[0]),
-                FusedActivation::Relu6 => relu6(y, output_scale[0], output_zero_point[0]),
+                FusedActivation::Relu6 => relu6(y, output_zero_point[0], relu6_max),
             }
         })
     })];

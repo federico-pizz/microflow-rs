@@ -5,7 +5,7 @@ use simba::scalar::SupersetOf;
 
 use crate::activation::{relu, relu6, FusedActivation};
 use crate::buffer::Buffer2D;
-use crate::quantize::Quantized;
+use crate::quantize::{quantize, Quantized};
 use crate::tensor::Tensor4D;
 
 pub struct TransposeConv2DOptions {
@@ -53,6 +53,7 @@ pub fn transpose_conv_2d<
         Buffer2D<f32, FILTERS_QUANTS, 1>,
     ),
 ) -> Tensor4D<T, 1, OUTPUT_ROWS, OUTPUT_COLS, FILTERS_BATCHES, 1> {
+    let relu6_max = quantize(6., output_scale[0], output_zero_point[0]);
     let input_zp = i32::from_subset(&input.zero_point[0]);
     let output = [Buffer2D::from_fn(|oh, ow| {
         array::from_fn(|co| {
@@ -117,7 +118,7 @@ pub fn transpose_conv_2d<
             match options.fused_activation {
                 FusedActivation::None => y,
                 FusedActivation::Relu => relu(y, output_zero_point[0]),
-                FusedActivation::Relu6 => relu6(y, output_scale[0], output_zero_point[0]),
+                FusedActivation::Relu6 => relu6(y, output_zero_point[0], relu6_max),
             }
         })
     })];

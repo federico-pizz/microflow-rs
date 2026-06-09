@@ -45,6 +45,7 @@ pub fn depthwise_conv_2d<
     constants: (
         Buffer2D<f32, WEIGHTS_CHANS, 1>,
         Buffer2D<f32, WEIGHTS_QUANTS, 1>,
+        Buffer2D<i32, WEIGHTS_CHANS, 1>,
     ),
 ) -> Tensor4D<T, 1, OUTPUT_ROWS, OUTPUT_COLS, WEIGHTS_CHANS, 1> {
     // Precompute values that are invariant across all output positions and channels
@@ -71,18 +72,26 @@ pub fn depthwise_conv_2d<
                         (acc.0 + v_c * i32::from_subset(&w[c]), acc.1 + v_c)
                     });
             let x = (mac, view_sum_c * weights_zero_point);
+            // Per-channel sum of the weights overlapping the (unpadded) input
+            // region; interior views reuse the precomputed sum, border views
+            // subtract the weights landing on padding.
+            let weights_sum_c = if view.len == WEIGHTS_ROWS * WEIGHTS_COLS {
+                constants.2[c]
+            } else {
+                constants.2[c]
+                    - weights.buffer[0].zip_fold(&view.mask, 0i32, |acc, w, m| {
+                        if m {
+                            acc
+                        } else {
+                            acc + i32::from_subset(&w[c])
+                        }
+                    })
+            };
             // Elaborate the constants
             let constants = (
                 constants.0,
                 constants.1,
-                input_zero_point
-                    * weights.buffer[0].zip_fold(&view.mask, 0i32, |acc, w, m| {
-                        if m {
-                            acc + i32::from_subset(&w[c])
-                        } else {
-                            acc
-                        }
-                    }),
+                input_zero_point * weights_sum_c,
                 view.len as i32 * input_zero_point * weights_zero_point,
             );
             // Combine the constant values and the variants to obtain the output
@@ -142,9 +151,14 @@ mod tests {
         view_padding: TensorViewPadding::Same,
         strides: (1, 1),
     };
-    const CONSTANTS: (Buffer2D<f32, 2, 1>, Buffer2D<f32, 2, 1>) = (
+    const CONSTANTS: (
+        Buffer2D<f32, 2, 1>,
+        Buffer2D<f32, 2, 1>,
+        Buffer2D<i32, 2, 1>,
+    ) = (
         matrix![-3.567_567_6; -3.675_675_7],
         matrix![0.094_864_86; 0.098_378_378],
+        matrix![120; 126],
     );
     const OUTPUT: Tensor4D<i8, 1, 2, 3, 2, 1> = Tensor4D {
         buffer: [matrix![

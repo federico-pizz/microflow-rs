@@ -7,6 +7,7 @@ use flatbuffers::{ForwardsUOffset, Vector};
 use nalgebra::DMatrix;
 use proc_macro2::TokenStream as TokenStream2;
 use quote::{format_ident, quote, ToTokens};
+use simba::scalar::SupersetOf;
 
 /// Represents the tokenized version of the `Conv2D` operator.
 pub(crate) struct TokenConv2D<T: TokenQuantized> {
@@ -15,7 +16,7 @@ pub(crate) struct TokenConv2D<T: TokenQuantized> {
     pub(crate) fused_activation: TokenFusedActivation,
     pub(crate) view_padding: TokenTensorViewPadding,
     pub(crate) strides: (usize, usize),
-    pub(crate) constants: (TokenBuffer2D<f32>, TokenBuffer2D<f32>),
+    pub(crate) constants: (TokenBuffer2D<f32>, TokenBuffer2D<f32>, TokenBuffer2D<i32>),
     pub(crate) index: usize,
 }
 
@@ -92,7 +93,7 @@ impl<T: TokenQuantized> TokenConv2D<T> {
         filters: &TokenTensor4D<T>,
         biases: &TokenTensor2D<i32>,
         output: &TokenTensor4D<T>,
-    ) -> (TokenBuffer2D<f32>, TokenBuffer2D<f32>) {
+    ) -> (TokenBuffer2D<f32>, TokenBuffer2D<f32>, TokenBuffer2D<i32>) {
         (
             TokenBuffer2D::from(DMatrix::from_fn(filters.shape[0], 1, |b, _| {
                 biases.scale.get(b).copied().unwrap_or(biases.scale[0]) / output.scale[0]
@@ -105,6 +106,14 @@ impl<T: TokenQuantized> TokenConv2D<T> {
             })),
             TokenBuffer2D::from(DMatrix::from_fn(filters.scale.len(), 1, |b, _| {
                 input.scale[0] * filters.scale[b] / output.scale[0]
+            })),
+            // Per-batch sum of all filter weights, so the runtime can skip the
+            // per-output-pixel fold for interior (fully in-bounds) views.
+            TokenBuffer2D::from(DMatrix::from_fn(filters.shape[0], 1, |b, _| {
+                filters.buffer[b]
+                    .iter()
+                    .map(|channels| channels.iter().map(|e| i32::from_subset(e)).sum::<i32>())
+                    .sum::<i32>()
             })),
         )
     }
@@ -121,7 +130,7 @@ impl<T: TokenQuantized> ToTokens for TokenConv2D<T> {
         let fused_activation = self.fused_activation;
         let view_padding = self.view_padding;
         let (strides_0, strides_1) = self.strides;
-        let (constants_0, constants_1) = &self.constants;
+        let (constants_0, constants_1, constants_2) = &self.constants;
 
         let ts = quote! {
             const #filters_ident: #filters_type = #filters;
@@ -136,7 +145,7 @@ impl<T: TokenQuantized> ToTokens for TokenConv2D<T> {
                         view_padding: #view_padding,
                         strides: (#strides_0, #strides_1),
                     },
-                    (#constants_0, #constants_1)
+                    (#constants_0, #constants_1, #constants_2)
             );
         };
         ts.to_tokens(tokens);
@@ -178,6 +187,7 @@ mod tests {
             constants: (
                 TokenBuffer2D::from(dmatrix![31., 32.]),
                 TokenBuffer2D::from(dmatrix![33., 34.]),
+                TokenBuffer2D::from(dmatrix![35, 36]),
             ),
             index: 0,
         }
@@ -204,6 +214,7 @@ mod tests {
         let constants = TokenConv2D::preprocess(&input, &layer.filters, &biases, &layer.output);
         assert_eq!(constants.0 .0, Some(dmatrix![-5.37931; -5.5172415]));
         assert_eq!(constants.1 .0, Some(dmatrix![0.30172414; 0.3137931]));
+        assert_eq!(constants.2 .0, Some(dmatrix![78; 222]));
     }
 
     #[test]
@@ -212,7 +223,7 @@ mod tests {
         let filters = &layer.filters;
         let fused_activation = layer.fused_activation;
         let view_padding = layer.view_padding;
-        let (constants_0, constants_1) = &layer.constants;
+        let (constants_0, constants_1, constants_2) = &layer.constants;
         assert_eq!(
             layer.to_token_stream().to_string(),
             quote! {
@@ -228,7 +239,7 @@ mod tests {
                             view_padding: #view_padding,
                             strides: (1usize, 1usize),
                         },
-                        (#constants_0, #constants_1)
+                        (#constants_0, #constants_1, #constants_2)
                 );
             }.to_string()
         );

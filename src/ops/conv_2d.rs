@@ -45,6 +45,7 @@ pub fn conv_2d<
     constants: (
         Buffer2D<f32, FILTERS_BATCHES, 1>,
         Buffer2D<f32, FILTERS_QUANTS, 1>,
+        Buffer2D<i32, FILTERS_BATCHES, 1>,
     ),
 ) -> Tensor4D<T, 1, OUTPUT_ROWS, OUTPUT_COLS, FILTERS_BATCHES, 1> {
     // Precompute values that are invariant across all output positions and filter batches
@@ -79,18 +80,27 @@ pub fn conv_2d<
                 // Use the hoisted view sum; only multiply by the per-batch filter zero point
                 view_sum * filters_zero_point,
             );
+            // Sum of the filter weights overlapping the (unpadded) input region.
+            // For interior views the whole filter is in bounds, so the precomputed
+            // per-batch sum is used directly; only border views pay for a fold,
+            // subtracting the weights that fall on padding.
+            let filter_sum = if view.len == FILTERS_ROWS * FILTERS_COLS {
+                constants.2[b]
+            } else {
+                constants.2[b]
+                    - filters.buffer[b].zip_fold(&view.mask, 0i32, |acc, f, m| {
+                        if m {
+                            acc
+                        } else {
+                            acc + f.iter().fold(0i32, |acc, e| acc + i32::from_subset(e))
+                        }
+                    })
+            };
             // Elaborate the constants
             let constants = (
                 constants.0,
                 constants.1,
-                input_zero_point
-                    * filters.buffer[b].zip_fold(&view.mask, 0i32, |acc, f, m| {
-                        if m {
-                            acc + f.iter().fold(0i32, |acc, e| acc + i32::from_subset(e))
-                        } else {
-                            acc
-                        }
-                    }),
+                input_zero_point * filter_sum,
                 view.len as i32 * INPUT_CHANS as i32 * input_zero_point * filters_zero_point,
             );
             // Combine the constant values and the variants to obtain the output
@@ -156,9 +166,14 @@ mod tests {
         view_padding: TensorViewPadding::Same,
         strides: (1, 1),
     };
-    const CONSTANTS: (Buffer2D<f32, 2, 1>, Buffer2D<f32, 2, 1>) = (
+    const CONSTANTS: (
+        Buffer2D<f32, 2, 1>,
+        Buffer2D<f32, 2, 1>,
+        Buffer2D<i32, 2, 1>,
+    ) = (
         matrix![-3.673_469_4; -3.755_102],
         matrix![0.103_469_39; 0.106_122_45],
+        matrix![246; 390],
     );
     const OUTPUT: Tensor4D<i8, 1, 2, 3, 2, 1> = Tensor4D {
         buffer: [matrix![

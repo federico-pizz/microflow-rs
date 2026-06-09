@@ -7,6 +7,7 @@ use flatbuffers::{ForwardsUOffset, Vector};
 use nalgebra::DMatrix;
 use proc_macro2::TokenStream as TokenStream2;
 use quote::{format_ident, quote, ToTokens};
+use simba::scalar::SupersetOf;
 
 /// Represents the tokenized version of the `DepthwiseConv2D` operator.
 pub(crate) struct TokenDepthwiseConv2D<T: TokenQuantized> {
@@ -15,7 +16,7 @@ pub(crate) struct TokenDepthwiseConv2D<T: TokenQuantized> {
     pub(crate) fused_activation: TokenFusedActivation,
     pub(crate) view_padding: TokenTensorViewPadding,
     pub(crate) strides: (usize, usize),
-    pub(crate) constants: (TokenBuffer2D<f32>, TokenBuffer2D<f32>),
+    pub(crate) constants: (TokenBuffer2D<f32>, TokenBuffer2D<f32>, TokenBuffer2D<i32>),
     pub(crate) index: usize,
 }
 
@@ -98,7 +99,7 @@ impl<T: TokenQuantized> TokenDepthwiseConv2D<T> {
         weights: &TokenTensor4D<T>,
         biases: &TokenTensor2D<i32>,
         output: &TokenTensor4D<T>,
-    ) -> (TokenBuffer2D<f32>, TokenBuffer2D<f32>) {
+    ) -> (TokenBuffer2D<f32>, TokenBuffer2D<f32>, TokenBuffer2D<i32>) {
         (
             TokenBuffer2D::from(DMatrix::from_fn(weights.shape[3], 1, |c, _| {
                 biases.scale.get(c).copied().unwrap_or(biases.scale[0]) / output.scale[0]
@@ -111,6 +112,14 @@ impl<T: TokenQuantized> TokenDepthwiseConv2D<T> {
             })),
             TokenBuffer2D::from(DMatrix::from_fn(weights.scale.len(), 1, |c, _| {
                 input.scale[0] * weights.scale[c] / output.scale[0]
+            })),
+            // Per-channel sum of the weights, so the runtime can skip the
+            // per-output-pixel fold for interior (fully in-bounds) views.
+            TokenBuffer2D::from(DMatrix::from_fn(weights.shape[3], 1, |c, _| {
+                weights.buffer[0]
+                    .iter()
+                    .map(|channels| i32::from_subset(&channels[c]))
+                    .sum::<i32>()
             })),
         )
     }
@@ -127,7 +136,7 @@ impl<T: TokenQuantized> ToTokens for TokenDepthwiseConv2D<T> {
         let fused_activation = self.fused_activation;
         let view_padding = self.view_padding;
         let (strides_0, strides_1) = self.strides;
-        let (constants_0, constants_1) = &self.constants;
+        let (constants_0, constants_1, constants_2) = &self.constants;
 
         let ts = quote! {
             const #weights_ident: #weights_type = #weights;
@@ -142,7 +151,7 @@ impl<T: TokenQuantized> ToTokens for TokenDepthwiseConv2D<T> {
                         view_padding: #view_padding,
                         strides: (#strides_0, #strides_1),
                     },
-                    (#constants_0, #constants_1)
+                    (#constants_0, #constants_1, #constants_2)
             );
         };
         ts.to_tokens(tokens);
@@ -178,6 +187,7 @@ mod tests {
             constants: (
                 TokenBuffer2D::from(dmatrix![19., 20.]),
                 TokenBuffer2D::from(dmatrix![21., 22.]),
+                TokenBuffer2D::from(dmatrix![23, 24]),
             ),
             index: 0,
         }
@@ -204,7 +214,8 @@ mod tests {
         let constants =
             TokenDepthwiseConv2D::preprocess(&input, &layer.weights, &biases, &layer.output);
         assert_eq!(constants.0 .0, Some(dmatrix![-6.3529415; -6.5882354]));
-        assert_eq!(constants.1 .0, Some(dmatrix![0.17588235; 0.18941177]))
+        assert_eq!(constants.1 .0, Some(dmatrix![0.17588235; 0.18941177]));
+        assert_eq!(constants.2 .0, Some(dmatrix![36; 42]))
     }
 
     #[test]
@@ -213,7 +224,7 @@ mod tests {
         let weights = &layer.weights;
         let fused_activation = layer.fused_activation;
         let view_padding = layer.view_padding;
-        let (constants_0, constants_1) = &layer.constants;
+        let (constants_0, constants_1, constants_2) = &layer.constants;
         assert_eq!(
             layer.to_token_stream().to_string(),
             quote! {
@@ -229,7 +240,7 @@ mod tests {
                             view_padding: #view_padding,
                             strides: (1usize, 1usize),
                         },
-                        (#constants_0, #constants_1)
+                        (#constants_0, #constants_1, #constants_2)
                 );
             }.to_string()
         );

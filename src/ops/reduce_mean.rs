@@ -1,10 +1,9 @@
 use core::array;
-use libm::roundf;
 
 use simba::scalar::SupersetOf;
 
 use crate::buffer::Buffer2D;
-use crate::quantize::Quantized;
+use crate::quantize::{requantize, Quantized};
 use crate::tensor::Tensor4D;
 
 /// Performs ReduceMean over the spatial dimensions (H and W) of a quantized 4D tensor,
@@ -47,9 +46,9 @@ pub fn reduce_mean<
                 });
                 // Subtract n*input_zp to convert sum-of-quantized to sum-of-dequantized (without scale)
                 // constants.0 = input_scale / (output_scale * n), constants.1 = f32(output_zero_point)
-                T::from_superset_unchecked(&roundf(
+                requantize::<T>(
                     constants.0 * (sum - n_times_zp) as f32 + constants.1,
-                ))
+                )
             })
         })
     });

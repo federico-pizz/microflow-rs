@@ -1,10 +1,9 @@
 use core::array;
-use libm::roundf;
 
 use simba::scalar::SupersetOf;
 
 use crate::buffer::Buffer2D;
-use crate::quantize::Quantized;
+use crate::quantize::{requantize, Quantized};
 use crate::tensor::Tensor4D;
 
 /// Performs channel-wise (axis=3) concatenation of two quantized 4D tensors.
@@ -52,7 +51,7 @@ pub fn concat<
                         constants.1,
                     )
                 };
-                T::from_superset_unchecked(&roundf(factor * raw + offset))
+                requantize::<T>(factor * raw + offset)
             })
         })
     });

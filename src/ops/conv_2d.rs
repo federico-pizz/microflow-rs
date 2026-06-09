@@ -1,11 +1,10 @@
 use core::array;
-use libm::roundf;
 
 use simba::scalar::SupersetOf;
 
 use crate::activation::{relu, relu6, FusedActivation};
 use crate::buffer::Buffer2D;
-use crate::quantize::{quantize, Quantized};
+use crate::quantize::{quantize, requantize, Quantized};
 use crate::tensor::{Tensor4D, TensorView, TensorViewPadding};
 
 pub struct Conv2DOptions {
@@ -25,7 +24,7 @@ pub struct Conv2DOptions {
 /// * `options` - Operator's options as an [`Conv2DOptions`] struct
 /// * `constants` - Constant values coming from the pre-processing phase
 ///
-#[inline(always)]
+#[inline]
 pub fn conv_2d<
     T: Quantized,
     const INPUT_ROWS: usize,
@@ -95,12 +94,12 @@ pub fn conv_2d<
                 view.len as i32 * INPUT_CHANS as i32 * input_zero_point * filters_zero_point,
             );
             // Combine the constant values and the variants to obtain the output
-            let y = T::from_superset_unchecked(&roundf(
+            let y = requantize::<T>(
                 f32::from_subset(&output_zero_point[0])
                     + constants.0[b]
                     + constants.1.get(b).copied().unwrap_or(constants.1[0])
                         * f32::from_subset(&(x.0 - x.1 - constants.2 + constants.3)),
-            ));
+            );
             // Apply the fused activation function (if any)
             match options.fused_activation {
                 FusedActivation::None => y,

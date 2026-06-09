@@ -1,12 +1,11 @@
 use core::array;
-use libm::roundf;
 
 use nalgebra::Const;
 use simba::scalar::SupersetOf;
 
 use crate::activation::{relu, relu6, FusedActivation};
 use crate::buffer::Buffer2D;
-use crate::quantize::{quantize, Quantized};
+use crate::quantize::{quantize, requantize, Quantized};
 use crate::tensor::{Tensor4D, TensorView, TensorViewPadding};
 
 pub struct AveragePool2DOptions {
@@ -57,7 +56,7 @@ pub fn average_pool_2d<
                 * view
                     .buffer
                     .fold(0i32, |acc, a| acc + i32::from_subset(&a[c])) as f32;
-            let y = T::from_superset_unchecked(&roundf(constants.0 * x + constants.1));
+            let y = requantize::<T>(constants.0 * x + constants.1);
             // Apply the fused activation function (if any)
             match options.fused_activation {
                 FusedActivation::None => y,

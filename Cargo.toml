@@ -42,6 +42,10 @@ harness = false
 name = "person_detect"
 harness = false
 
+[[bench]]
+name = "nano_u"
+harness = false
+
 [workspace]
 members = ["microflow-macros"]
 exclude = ["examples"]

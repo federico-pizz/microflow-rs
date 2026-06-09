@@ -1,9 +1,8 @@
-use libm::roundf;
 use simba::scalar::SupersetOf;
 
 use crate::activation::{relu, relu6, FusedActivation};
 use crate::buffer::Buffer2D;
-use crate::quantize::{quantize, Quantized};
+use crate::quantize::{quantize, requantize, Quantized};
 use crate::tensor::Tensor2D;
 
 pub struct FullyConnectedOptions {
@@ -67,12 +66,12 @@ pub fn fully_connected<
     );
     // Combine the constant values and the variants to obtain the output
     let output = Buffer2D::from_fn(|i, j| {
-        let y = T::from_superset_unchecked(&roundf(
+        let y = requantize::<T>(
             f32::from_subset(&output_zero_point[0])
                 + constants.0[j]
                 + constants.1
                     * f32::from_subset(&(x.0[(i, j)] - x.1[i] - constants.2[j] + constants.3)),
-        ));
+        );
         // Apply the fused activation function (if any)
         match options.fused_activation {
             FusedActivation::None => y,

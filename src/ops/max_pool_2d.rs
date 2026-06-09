@@ -1,12 +1,11 @@
 use core::array;
-use libm::roundf;
 
 use nalgebra::Const;
 use simba::scalar::SupersetOf;
 
 use crate::activation::{relu, relu6, FusedActivation};
 use crate::buffer::Buffer2D;
-use crate::quantize::{quantize, Quantized};
+use crate::quantize::{quantize, requantize, Quantized};
 use crate::tensor::{Tensor4D, TensorView, TensorViewPadding};
 
 pub struct MaxPool2DOptions {
@@ -26,7 +25,7 @@ pub struct MaxPool2DOptions {
 /// * `options` - Operator's options as a [`MaxPool2DOptions`] struct
 /// * `constants` - Constant values coming from the pre-processing phase
 ///
-#[inline(always)]
+#[inline]
 pub fn max_pool_2d<
     T: Quantized,
     const INPUT_ROWS: usize,
@@ -58,7 +57,7 @@ pub fn max_pool_2d<
                     acc
                 }
             }) as f32;
-            let y = T::from_superset_unchecked(&roundf(constants.0 * x + constants.1));
+            let y = requantize::<T>(constants.0 * x + constants.1);
             // Apply the fused activation function (if any)
             match options.fused_activation {
                 FusedActivation::None => y,

@@ -1,11 +1,10 @@
 use core::array;
-use libm::roundf;
 
 use simba::scalar::SupersetOf;
 
 use crate::activation::{relu, relu6, FusedActivation};
 use crate::buffer::Buffer2D;
-use crate::quantize::{quantize, Quantized};
+use crate::quantize::{quantize, requantize, Quantized};
 use crate::tensor::Tensor4D;
 
 pub struct TransposeConv2DOptions {
@@ -110,11 +109,11 @@ pub fn transpose_conv_2d<
                 .copied()
                 .unwrap_or(constants.1[0]);
 
-            let y = T::from_superset_unchecked(&roundf(
+            let y = requantize::<T>(
                 f32::from_subset(&output_zero_point[0])
                     + constants.0[co]
                     + mac_scale * corrected as f32,
-            ));
+            );
             match options.fused_activation {
                 FusedActivation::None => y,
                 FusedActivation::Relu => relu(y, output_zero_point[0]),

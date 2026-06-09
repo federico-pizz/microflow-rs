@@ -1,9 +1,8 @@
-use libm::roundf;
 
 use simba::scalar::SupersetOf;
 
 use crate::activation::{relu, relu6, FusedActivation};
-use crate::quantize::{quantize, Quantized};
+use crate::quantize::{quantize, requantize, Quantized};
 use crate::tensor::Tensor4D;
 
 pub struct MulOptions {
@@ -52,9 +51,9 @@ pub fn mul<
                     let bv = f32::from_subset(&b_vals[c]);
                     // Expand (a - zp1)(b - zp2) with precomputed coefficients to avoid
                     // redundant dequantize/requantize steps.
-                    let y = T::from_superset_unchecked(&roundf(
+                    let y = requantize::<T>(
                         constants.0 * a * bv - constants.1 * bv - constants.2 * a + constants.3,
-                    ));
+                    );
                     input1.buffer[b][(i, j)][c] = match options.fused_activation {
                         FusedActivation::None => y,
                         FusedActivation::Relu => relu(y, output_zero_point[0]),

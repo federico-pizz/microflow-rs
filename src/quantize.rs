@@ -28,6 +28,21 @@ pub fn dequantize<T: Quantized>(input: T, scale: f32, zero_point: T) -> f32 {
     scale * (f32::from_subset(&input) - f32::from_subset(&zero_point))
 }
 
+/// Rounds an already-scaled floating-point accumulator to the nearest integer
+/// (ties away from zero) and narrows it to the quantized type, saturating to the
+/// representable range as TFLite does.
+///
+/// This is the requantization tail shared by every quantized kernel. It avoids
+/// `libm::roundf`, which is a full software routine on targets without an FPU
+/// (e.g. Cortex-M0/M3, AVR, Xtensa LX6): adding `±0.5` and letting the `f32 -> T`
+/// cast truncate toward zero yields round-half-away-from-zero in a couple of
+/// instructions. The cast saturates, preserving the int8/uint8 clamping that the
+/// previous `roundf` + unchecked conversion relied on.
+#[inline(always)]
+pub fn requantize<T: Quantized>(value: f32) -> T {
+    T::from_superset_unchecked(&(value + 0.5_f32.copysign(value)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -4,7 +4,7 @@ use simba::scalar::SupersetOf;
 
 use crate::activation::{relu, relu6, FusedActivation};
 use crate::buffer::Buffer2D;
-use crate::quantize::{quantize, requantize, Quantized};
+use crate::quantize::{multiply_by_quantized_multiplier, quantize, saturating_cast, Quantized};
 use crate::tensor::Tensor4D;
 
 pub struct TransposeConv2DOptions {
@@ -48,12 +48,14 @@ pub fn transpose_conv_2d<
     output_zero_point: [T; 1],
     options: TransposeConv2DOptions,
     constants: (
-        Buffer2D<f32, FILTERS_BATCHES, 1>,
-        Buffer2D<f32, FILTERS_QUANTS, 1>,
+        Buffer2D<i32, FILTERS_BATCHES, 1>,
+        Buffer2D<i32, FILTERS_QUANTS, 1>,
+        Buffer2D<i32, FILTERS_QUANTS, 1>,
     ),
 ) -> Tensor4D<T, 1, OUTPUT_ROWS, OUTPUT_COLS, FILTERS_BATCHES, 1> {
     let relu6_max = quantize(6., output_scale[0], output_zero_point[0]);
     let input_zp = i32::from_subset(&input.zero_point[0]);
+    let output_zero_point_i32 = i32::from_subset(&output_zero_point[0]);
     let output = [Buffer2D::from_fn(|oh, ow| {
         array::from_fn(|co| {
             let filter_zp = i32::from_subset(
@@ -79,11 +81,8 @@ pub fn transpose_conv_2d<
                                 let w = (ow - kw) / options.strides.1;
                                 if w < INPUT_COLS {
                                     for ci in 0..INPUT_CHANS {
-                                        let a =
-                                            i32::from_subset(&input.buffer[0][(h, w)][ci]);
-                                        let f = i32::from_subset(
-                                            &filters.buffer[co][(kh, kw)][ci],
-                                        );
+                                        let a = i32::from_subset(&input.buffer[0][(h, w)][ci]);
+                                        let f = i32::from_subset(&filters.buffer[co][(kh, kw)][ci]);
                                         mac += a * f;
                                         input_sum += a;
                                         filter_sum += f;
@@ -98,21 +97,18 @@ pub fn transpose_conv_2d<
 
             // Apply the same quantization correction as Conv2D:
             // corrected = mac - filter_zp*input_sum - input_zp*filter_sum + valid*input_zp*filter_zp
-            let corrected = mac
-                - filter_zp * input_sum
-                - input_zp * filter_sum
+            let corrected = mac - filter_zp * input_sum - input_zp * filter_sum
                 + valid_count * input_zp * filter_zp;
 
-            let mac_scale = constants
-                .1
-                .get(co)
-                .copied()
-                .unwrap_or(constants.1[0]);
-
-            let y = requantize::<T>(
-                f32::from_subset(&output_zero_point[0])
-                    + constants.0[co]
-                    + mac_scale * corrected as f32,
+            // Fold the integer bias into the corrected accumulator, then requantize
+            // entirely in integer arithmetic.
+            let acc = corrected + constants.0[co];
+            let y = saturating_cast::<T>(
+                multiply_by_quantized_multiplier(
+                    acc,
+                    constants.1.get(co).copied().unwrap_or(constants.1[0]),
+                    constants.2.get(co).copied().unwrap_or(constants.2[0]),
+                ) + output_zero_point_i32,
             );
             match options.fused_activation {
                 FusedActivation::None => y,
@@ -159,10 +155,7 @@ mod tests {
         zero_point: [0],
     };
     const FILTERS: Tensor4D<i8, 2, 2, 1, 1, 2> = Tensor4D {
-        buffer: [
-            matrix![[3]; [4]],
-            matrix![[5]; [6]],
-        ],
+        buffer: [matrix![[3]; [4]], matrix![[5]; [6]]],
         scale: [0.1, 0.1],
         zero_point: [0, 0],
     };
@@ -177,10 +170,16 @@ mod tests {
         fused_activation: FusedActivation::None,
         strides: (2, 1),
     };
-    // bias=0 for both channels, mac_scale = input_scale * filter_scale / output_scale = 0.1*0.1/0.01 = 1.0
-    const CONSTANTS: (Buffer2D<f32, 2, 1>, Buffer2D<f32, 2, 1>) = (
-        matrix![0.0; 0.0],
-        matrix![1.0; 1.0],
+    // bias=0 for both channels, M = input_scale * filter_scale / output_scale = 0.1*0.1/0.01 = 1.0,
+    // which decomposes to multiplier=2^30, shift=1.
+    const CONSTANTS: (
+        Buffer2D<i32, 2, 1>,
+        Buffer2D<i32, 2, 1>,
+        Buffer2D<i32, 2, 1>,
+    ) = (
+        matrix![0; 0],
+        matrix![1_073_741_824; 1_073_741_824],
+        matrix![1; 1],
     );
     const OUTPUT: Tensor4D<i8, 1, 3, 2, 2, 1> = Tensor4D {
         buffer: [matrix![

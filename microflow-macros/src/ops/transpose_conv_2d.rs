@@ -5,7 +5,7 @@ use quote::{format_ident, quote, ToTokens};
 
 use crate::activation::TokenFusedActivation;
 use crate::buffer::TokenBuffer2D;
-use crate::quantize::TokenQuantized;
+use crate::quantize::{quantize_multiplier, TokenQuantized};
 use crate::tensor::{TokenTensor2D, TokenTensor4D};
 use crate::tflite_flatbuffers::tflite::{Buffer, Operator, Tensor, TensorType};
 
@@ -15,7 +15,7 @@ pub(crate) struct TokenTransposeConv2D<T: TokenQuantized> {
     pub(crate) output: TokenTensor4D<T>,
     pub(crate) fused_activation: TokenFusedActivation,
     pub(crate) strides: (usize, usize),
-    pub(crate) constants: (TokenBuffer2D<f32>, TokenBuffer2D<f32>),
+    pub(crate) constants: (TokenBuffer2D<i32>, TokenBuffer2D<i32>, TokenBuffer2D<i32>),
     pub(crate) index: usize,
 }
 
@@ -58,7 +58,9 @@ impl<T: TokenQuantized> TokenTransposeConv2D<T> {
         let output = TokenTensor4D::<T>::from_empty_tensor(
             tensors.get(operator.outputs().unwrap().get(0) as usize),
         );
-        let options = operator.builtin_options_as_transpose_conv_options().unwrap();
+        let options = operator
+            .builtin_options_as_transpose_conv_options()
+            .unwrap();
 
         let biases = if inputs.len() >= 4 {
             let bias_idx = inputs.get(3) as usize;
@@ -91,20 +93,42 @@ impl<T: TokenQuantized> TokenTransposeConv2D<T> {
         filters: &TokenTensor4D<T>,
         biases: Option<&TokenTensor2D<i32>>,
         output: &TokenTensor4D<T>,
-    ) -> (TokenBuffer2D<f32>, TokenBuffer2D<f32>) {
+    ) -> (TokenBuffer2D<i32>, TokenBuffer2D<i32>, TokenBuffer2D<i32>) {
         let out_ch = filters.shape[0];
+        // Requantization scale M = input_scale * filter_scale / output_scale,
+        // decomposed once per quantization channel into a fixed-point pair.
+        let mul_shift: Vec<(i32, i32)> = (0..filters.scale.len())
+            .map(|b| {
+                quantize_multiplier(
+                    input.scale[0] as f64 * filters.scale[b] as f64 / output.scale[0] as f64,
+                )
+            })
+            .collect();
         (
+            // Integer bias in accumulator units (input_scale * filter_scale).
             TokenBuffer2D::from(DMatrix::from_fn(out_ch, 1, |b, _| {
                 if let Some(bias) = biases {
                     let bs = bias.scale.get(b).copied().unwrap_or(bias.scale[0]);
-                    let bzp = bias.zero_point.get(b).copied().unwrap_or(bias.zero_point[0]);
-                    bs / output.scale[0] * (bias.buffer[b] - bzp) as f32
+                    let bzp = bias
+                        .zero_point
+                        .get(b)
+                        .copied()
+                        .unwrap_or(bias.zero_point[0]);
+                    let filter_scale = filters.scale.get(b).copied().unwrap_or(filters.scale[0]);
+                    ((bias.buffer[b] - bzp) as f64 * bs as f64
+                        / (input.scale[0] as f64 * filter_scale as f64))
+                        .round() as i32
                 } else {
-                    0.0f32
+                    0
                 }
             })),
+            // Q0.31 multiplier of M.
             TokenBuffer2D::from(DMatrix::from_fn(filters.scale.len(), 1, |b, _| {
-                input.scale[0] * filters.scale[b] / output.scale[0]
+                mul_shift[b].0
+            })),
+            // Power-of-two shift accompanying the multiplier.
+            TokenBuffer2D::from(DMatrix::from_fn(filters.scale.len(), 1, |b, _| {
+                mul_shift[b].1
             })),
         )
     }
@@ -120,7 +144,7 @@ impl<T: TokenQuantized> ToTokens for TokenTransposeConv2D<T> {
         let output_zero_point = &self.output.zero_point;
         let fused_activation = self.fused_activation;
         let (strides_0, strides_1) = self.strides;
-        let (constants_0, constants_1) = &self.constants;
+        let (constants_0, constants_1, constants_2) = &self.constants;
 
         let ts = quote! {
             const #filters_ident: #filters_type = #filters;
@@ -134,7 +158,7 @@ impl<T: TokenQuantized> ToTokens for TokenTransposeConv2D<T> {
                         fused_activation: #fused_activation,
                         strides: (#strides_0, #strides_1),
                     },
-                    (#constants_0, #constants_1)
+                    (#constants_0, #constants_1, #constants_2)
                 );
         };
         ts.to_tokens(tokens);
@@ -167,8 +191,9 @@ mod tests {
             fused_activation: TokenFusedActivation::None,
             strides: (2, 1),
             constants: (
-                TokenBuffer2D::from(dmatrix![0.0f32; 0.0]),
-                TokenBuffer2D::from(dmatrix![1.0f32; 1.0]),
+                TokenBuffer2D::from(dmatrix![0i32; 0]),
+                TokenBuffer2D::from(dmatrix![1_073_741_824i32; 1_073_741_824]),
+                TokenBuffer2D::from(dmatrix![1i32; 1]),
             ),
             index: 0,
         }
@@ -179,7 +204,7 @@ mod tests {
         let layer = setup();
         let filters = &layer.filters;
         let fused_activation = layer.fused_activation;
-        let (constants_0, constants_1) = &layer.constants;
+        let (constants_0, constants_1, constants_2) = &layer.constants;
         assert_eq!(
             layer.to_token_stream().to_string(),
             quote! {
@@ -194,7 +219,7 @@ mod tests {
                             fused_activation: #fused_activation,
                             strides: (2usize, 1usize),
                         },
-                        (#constants_0, #constants_1)
+                        (#constants_0, #constants_1, #constants_2)
                     );
             }
             .to_string()

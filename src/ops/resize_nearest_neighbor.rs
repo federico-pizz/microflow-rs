@@ -1,7 +1,7 @@
-use core::array;
 use crate::buffer::Buffer2D;
 use crate::quantize::Quantized;
 use crate::tensor::Tensor4D;
+use core::array;
 use libm::{floorf, roundf};
 use simba::scalar::SupersetOf;
 
@@ -20,6 +20,7 @@ pub struct ResizeNearestNeighborOptions {
 /// * `output_zero_point` - The zero point of the resulting output tensor.
 /// * `options` - Operator's options as a [`ResizeNearestNeighborOptions`] struct.
 /// * `constants` - A tuple of pre-calculated f32 values for requantization.
+#[inline(always)]
 pub fn resize_nearest_neighbor<
     T: Quantized,
     const INPUT_ROWS: usize,
@@ -86,13 +87,8 @@ mod tests {
             align_corners: false,
             half_pixel_centers: false,
         };
-        let output: Tensor4D<i8, 1, 4, 4, 1, 1> = resize_nearest_neighbor(
-            INPUT,
-            OUTPUT_SCALE,
-            OUTPUT_ZERO_POINT,
-            options,
-            CONSTANTS,
-        );
+        let output: Tensor4D<i8, 1, 4, 4, 1, 1> =
+            resize_nearest_neighbor(INPUT, OUTPUT_SCALE, OUTPUT_ZERO_POINT, options, CONSTANTS);
         let expected = [
             [10, 10, 20, 20],
             [10, 10, 20, 20],
@@ -122,32 +118,22 @@ mod tests {
             align_corners: false,
             half_pixel_centers: false,
         };
-        let output: Tensor4D<i8, 1, 2, 2, 1, 1> = resize_nearest_neighbor(
-            input,
-            OUTPUT_SCALE,
-            OUTPUT_ZERO_POINT,
-            options,
-            CONSTANTS,
-        );
+        let output: Tensor4D<i8, 1, 2, 2, 1, 1> =
+            resize_nearest_neighbor(input, OUTPUT_SCALE, OUTPUT_ZERO_POINT, options, CONSTANTS);
         assert_eq!(output.buffer[0][(0, 0)][0], 10);
         assert_eq!(output.buffer[0][(0, 1)][0], 30);
         assert_eq!(output.buffer[0][(1, 0)][0], 90);
         assert_eq!(output.buffer[0][(1, 1)][0], 110);
     }
-    
+
     #[test]
     fn test_align_corners() {
         let options = ResizeNearestNeighborOptions {
             align_corners: true,
             half_pixel_centers: false,
         };
-        let output: Tensor4D<i8, 1, 3, 3, 1, 1> = resize_nearest_neighbor(
-            INPUT,
-            OUTPUT_SCALE,
-            OUTPUT_ZERO_POINT,
-            options,
-            CONSTANTS,
-        );
+        let output: Tensor4D<i8, 1, 3, 3, 1, 1> =
+            resize_nearest_neighbor(INPUT, OUTPUT_SCALE, OUTPUT_ZERO_POINT, options, CONSTANTS);
         let expected = [[10, 20, 20], [30, 40, 40], [30, 40, 40]];
         for r in 0..3 {
             for c in 0..3 {
@@ -162,13 +148,8 @@ mod tests {
             align_corners: false,
             half_pixel_centers: true,
         };
-        let output: Tensor4D<i8, 1, 3, 3, 1, 1> = resize_nearest_neighbor(
-            INPUT,
-            OUTPUT_SCALE,
-            OUTPUT_ZERO_POINT,
-            options,
-            CONSTANTS,
-        );
-        assert_eq!(output.buffer[0][(1, 1)][0], 40); 
+        let output: Tensor4D<i8, 1, 3, 3, 1, 1> =
+            resize_nearest_neighbor(INPUT, OUTPUT_SCALE, OUTPUT_ZERO_POINT, options, CONSTANTS);
+        assert_eq!(output.buffer[0][(1, 1)][0], 40);
     }
 }

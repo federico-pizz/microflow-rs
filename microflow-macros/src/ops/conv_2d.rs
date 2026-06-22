@@ -1,6 +1,6 @@
 use crate::activation::TokenFusedActivation;
 use crate::buffer::TokenBuffer2D;
-use crate::quantize::TokenQuantized;
+use crate::quantize::{quantize_multiplier, TokenQuantized};
 use crate::tensor::{TokenTensor2D, TokenTensor4D, TokenTensorViewPadding};
 use crate::tflite_flatbuffers::tflite::{Buffer, Operator, Tensor, TensorType};
 use flatbuffers::{ForwardsUOffset, Vector};
@@ -16,7 +16,12 @@ pub(crate) struct TokenConv2D<T: TokenQuantized> {
     pub(crate) fused_activation: TokenFusedActivation,
     pub(crate) view_padding: TokenTensorViewPadding,
     pub(crate) strides: (usize, usize),
-    pub(crate) constants: (TokenBuffer2D<f32>, TokenBuffer2D<f32>, TokenBuffer2D<i32>),
+    pub(crate) constants: (
+        TokenBuffer2D<i32>,
+        TokenBuffer2D<i32>,
+        TokenBuffer2D<i32>,
+        TokenBuffer2D<i32>,
+    ),
     pub(crate) index: usize,
 }
 
@@ -93,19 +98,43 @@ impl<T: TokenQuantized> TokenConv2D<T> {
         filters: &TokenTensor4D<T>,
         biases: &TokenTensor2D<i32>,
         output: &TokenTensor4D<T>,
-    ) -> (TokenBuffer2D<f32>, TokenBuffer2D<f32>, TokenBuffer2D<i32>) {
+    ) -> (
+        TokenBuffer2D<i32>,
+        TokenBuffer2D<i32>,
+        TokenBuffer2D<i32>,
+        TokenBuffer2D<i32>,
+    ) {
+        // Requantization scale M = input_scale * filter_scale / output_scale,
+        // decomposed once per quantization channel into a fixed-point pair.
+        let mul_shift: Vec<(i32, i32)> = (0..filters.scale.len())
+            .map(|c| {
+                quantize_multiplier(
+                    input.scale[0] as f64 * filters.scale[c] as f64 / output.scale[0] as f64,
+                )
+            })
+            .collect();
         (
+            // Integer bias expressed in accumulator units (input_scale * filter_scale),
+            // so the runtime can fold it into the i32 accumulator before requantizing.
             TokenBuffer2D::from(DMatrix::from_fn(filters.shape[0], 1, |b, _| {
-                biases.scale.get(b).copied().unwrap_or(biases.scale[0]) / output.scale[0]
-                    * (biases.buffer[b]
-                        - biases
-                            .zero_point
-                            .get(b)
-                            .copied()
-                            .unwrap_or(biases.zero_point[0])) as f32
+                let filter_scale = filters.scale.get(b).copied().unwrap_or(filters.scale[0]);
+                let bias_zero_point = biases
+                    .zero_point
+                    .get(b)
+                    .copied()
+                    .unwrap_or(biases.zero_point[0]);
+                ((biases.buffer[b] - bias_zero_point) as f64
+                    * biases.scale.get(b).copied().unwrap_or(biases.scale[0]) as f64
+                    / (input.scale[0] as f64 * filter_scale as f64))
+                    .round() as i32
             })),
+            // Q0.31 multiplier of M.
             TokenBuffer2D::from(DMatrix::from_fn(filters.scale.len(), 1, |b, _| {
-                input.scale[0] * filters.scale[b] / output.scale[0]
+                mul_shift[b].0
+            })),
+            // Power-of-two shift accompanying the multiplier.
+            TokenBuffer2D::from(DMatrix::from_fn(filters.scale.len(), 1, |b, _| {
+                mul_shift[b].1
             })),
             // Per-batch sum of all filter weights, so the runtime can skip the
             // per-output-pixel fold for interior (fully in-bounds) views.
@@ -130,7 +159,7 @@ impl<T: TokenQuantized> ToTokens for TokenConv2D<T> {
         let fused_activation = self.fused_activation;
         let view_padding = self.view_padding;
         let (strides_0, strides_1) = self.strides;
-        let (constants_0, constants_1, constants_2) = &self.constants;
+        let (constants_0, constants_1, constants_2, constants_3) = &self.constants;
 
         let ts = quote! {
             const #filters_ident: #filters_type = #filters;
@@ -145,7 +174,7 @@ impl<T: TokenQuantized> ToTokens for TokenConv2D<T> {
                         view_padding: #view_padding,
                         strides: (#strides_0, #strides_1),
                     },
-                    (#constants_0, #constants_1, #constants_2)
+                    (#constants_0, #constants_1, #constants_2, #constants_3)
             );
         };
         ts.to_tokens(tokens);
@@ -185,9 +214,10 @@ mod tests {
             view_padding: TokenTensorViewPadding::Same,
             strides: (1, 1),
             constants: (
-                TokenBuffer2D::from(dmatrix![31., 32.]),
-                TokenBuffer2D::from(dmatrix![33., 34.]),
+                TokenBuffer2D::from(dmatrix![31, 32]),
+                TokenBuffer2D::from(dmatrix![33, 34]),
                 TokenBuffer2D::from(dmatrix![35, 36]),
+                TokenBuffer2D::from(dmatrix![37, 38]),
             ),
             index: 0,
         }
@@ -212,9 +242,10 @@ mod tests {
             zero_point: vec![41, 42],
         };
         let constants = TokenConv2D::preprocess(&input, &layer.filters, &biases, &layer.output);
-        assert_eq!(constants.0 .0, Some(dmatrix![-5.37931; -5.5172415]));
-        assert_eq!(constants.1 .0, Some(dmatrix![0.30172414; 0.3137931]));
-        assert_eq!(constants.2 .0, Some(dmatrix![78; 222]));
+        assert_eq!(constants.0 .0, Some(dmatrix![-18; -18]));
+        assert_eq!(constants.1 .0, Some(dmatrix![1295895320; 1347731083]));
+        assert_eq!(constants.2 .0, Some(dmatrix![-1; -1]));
+        assert_eq!(constants.3 .0, Some(dmatrix![78; 222]));
     }
 
     #[test]
@@ -223,7 +254,7 @@ mod tests {
         let filters = &layer.filters;
         let fused_activation = layer.fused_activation;
         let view_padding = layer.view_padding;
-        let (constants_0, constants_1, constants_2) = &layer.constants;
+        let (constants_0, constants_1, constants_2, constants_3) = &layer.constants;
         assert_eq!(
             layer.to_token_stream().to_string(),
             quote! {
@@ -239,7 +270,7 @@ mod tests {
                             view_padding: #view_padding,
                             strides: (1usize, 1usize),
                         },
-                        (#constants_0, #constants_1, #constants_2)
+                        (#constants_0, #constants_1, #constants_2, #constants_3)
                 );
             }.to_string()
         );

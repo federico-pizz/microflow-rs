@@ -26,7 +26,7 @@ fn nano_u_model() {
     let output = NanoU::predict(input);
     let fp = fingerprint(&format!("{output:?}"));
     assert_eq!(
-        fp, 0xa9f4_5525_9497_cee3,
+        fp, 0x0e4d_491d_1e63_de08,
         "nano_u output fingerprint changed: {fp:#018x}"
     );
 }

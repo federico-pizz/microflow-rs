@@ -6,7 +6,7 @@ use simba::scalar::SupersetOf;
 
 use crate::activation::TokenFusedActivation;
 use crate::buffer::TokenBuffer2D;
-use crate::quantize::TokenQuantized;
+use crate::quantize::{quantize_multiplier, TokenQuantized};
 use crate::tensor::TokenTensor2D;
 use crate::tflite_flatbuffers::tflite::{Buffer, Operator, Tensor, TensorType};
 
@@ -15,7 +15,7 @@ pub(crate) struct TokenFullyConnected<T: TokenQuantized> {
     pub(crate) weights: TokenTensor2D<T>,
     pub(crate) output: TokenTensor2D<T>,
     pub(crate) fused_activation: TokenFusedActivation,
-    pub(crate) constants: (TokenBuffer2D<f32>, f32, TokenBuffer2D<i32>, i32),
+    pub(crate) constants: (TokenBuffer2D<i32>, i32, i32, TokenBuffer2D<i32>, i32),
     pub(crate) index: usize,
     pub(crate) reshape: bool,
 }
@@ -98,16 +98,24 @@ impl<T: TokenQuantized> TokenFullyConnected<T> {
         weights: &TokenTensor2D<T>,
         biases: &TokenTensor2D<i32>,
         output: &TokenTensor2D<T>,
-    ) -> (TokenBuffer2D<f32>, f32, TokenBuffer2D<i32>, i32) {
+    ) -> (TokenBuffer2D<i32>, i32, i32, TokenBuffer2D<i32>, i32) {
+        // Requantization scale M = input_scale * weight_scale / output_scale,
+        // decomposed into a fixed-point (multiplier, shift) pair.
+        let (multiplier, shift) = quantize_multiplier(
+            input.scale[0] as f64 * weights.scale[0] as f64 / output.scale[0] as f64,
+        );
+        // Integer bias expressed in accumulator units (input_scale * weight_scale).
+        let bias_factor =
+            biases.scale[0] as f64 / (input.scale[0] as f64 * weights.scale[0] as f64);
+        let bias_zero_point = biases.zero_point[0];
         (
             TokenBuffer2D::from(
-                biases.scale[0] / output.scale[0]
-                    * biases
-                        .buffer
-                        .add_scalar(-biases.zero_point[0])
-                        .cast::<f32>(),
+                biases
+                    .buffer
+                    .map(|b| (((b - bias_zero_point) as f64) * bias_factor).round() as i32),
             ),
-            input.scale[0] * weights.scale[0] / output.scale[0],
+            multiplier,
+            shift,
             TokenBuffer2D::from(DMatrix::from_rows(&[
                 convert_ref::<DMatrix<T>, DMatrix<i32>>(&weights.buffer).row_sum()
                     * i32::from_subset(&input.zero_point[0]),
@@ -133,7 +141,7 @@ impl<T: TokenQuantized> ToTokens for TokenFullyConnected<T> {
         let output_scale = self.output.scale[0];
         let output_zero_point = self.output.zero_point[0];
         let fused_activation = self.fused_activation;
-        let (constants_0, constants_1, constants_2, constants_3) = &self.constants;
+        let (constants_0, constants_1, constants_2, constants_3, constants_4) = &self.constants;
 
         let ts = quote! {
             const #weights_ident: #weights_type = #weights;
@@ -146,7 +154,7 @@ impl<T: TokenQuantized> ToTokens for TokenFullyConnected<T> {
                     microflow::ops::FullyConnectedOptions {
                         fused_activation: #fused_activation,
                     },
-                    (#constants_0, #constants_1, #constants_2, #constants_3)
+                    (#constants_0, #constants_1, #constants_2, #constants_3, #constants_4)
             );
         };
         ts.to_tokens(tokens);
@@ -178,8 +186,9 @@ mod tests {
             },
             fused_activation: TokenFusedActivation::Relu,
             constants: (
-                TokenBuffer2D::from(dmatrix![11., 12.]),
-                13.,
+                TokenBuffer2D::from(dmatrix![11, 12]),
+                13,
+                0,
                 TokenBuffer2D::from(dmatrix![14, 15]),
                 16,
             ),
@@ -209,13 +218,11 @@ mod tests {
         };
         let constants =
             TokenFullyConnected::preprocess(&input, &layer.weights, &biases, &layer.output);
-        assert_eq!(
-            constants.0 .0,
-            Some(dmatrix![-0.9777778; -0.73333335; -0.4888889])
-        );
-        assert_eq!(constants.1, 0.13222224);
-        assert_eq!(constants.2 .0, Some(dmatrix![90, 126, 162]));
-        assert_eq!(constants.3, 288);
+        assert_eq!(constants.0 .0, Some(dmatrix![-7; -6; -4]));
+        assert_eq!(constants.1, 1135780263);
+        assert_eq!(constants.2, -2);
+        assert_eq!(constants.3 .0, Some(dmatrix![90, 126, 162]));
+        assert_eq!(constants.4, 288);
     }
 
     #[test]
@@ -224,7 +231,7 @@ mod tests {
         let weights = &layer.weights;
         let fused_activation = layer.fused_activation;
         let constants_0 = &layer.constants.0;
-        let constants_2 = &layer.constants.2;
+        let constants_3 = &layer.constants.3;
         assert_eq!(
             layer.to_token_stream().to_string(),
             quote! {
@@ -238,7 +245,7 @@ mod tests {
                         microflow::ops::FullyConnectedOptions {
                             fused_activation: #fused_activation,
                         },
-                        (#constants_0, 13f32, #constants_2, 16i32)
+                        (#constants_0, 13i32, 0i32, #constants_3, 16i32)
                 );
             }
             .to_string()

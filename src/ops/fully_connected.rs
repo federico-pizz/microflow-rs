@@ -2,7 +2,7 @@ use simba::scalar::SupersetOf;
 
 use crate::activation::{relu, relu6, FusedActivation};
 use crate::buffer::Buffer2D;
-use crate::quantize::{quantize, requantize, Quantized};
+use crate::quantize::{multiply_by_quantized_multiplier, quantize, saturating_cast, Quantized};
 use crate::tensor::Tensor2D;
 
 pub struct FullyConnectedOptions {
@@ -33,13 +33,15 @@ pub fn fully_connected<
     output_zero_point: [T; 1],
     options: FullyConnectedOptions,
     constants: (
-        Buffer2D<f32, WEIGHTS_COLS, 1>,
-        f32,
+        Buffer2D<i32, WEIGHTS_COLS, 1>,
+        i32,
+        i32,
         Buffer2D<i32, 1, WEIGHTS_COLS>,
         i32,
     ),
 ) -> Tensor2D<T, INPUT_ROWS, WEIGHTS_COLS, 1> {
     let relu6_max = quantize(6., output_scale[0], output_zero_point[0]);
+    let output_zero_point_i32 = i32::from_subset(&output_zero_point[0]);
     let x: (
         Buffer2D<i32, INPUT_ROWS, WEIGHTS_COLS>,
         Buffer2D<i32, INPUT_ROWS, 1>,
@@ -66,11 +68,10 @@ pub fn fully_connected<
     );
     // Combine the constant values and the variants to obtain the output
     let output = Buffer2D::from_fn(|i, j| {
-        let y = requantize::<T>(
-            f32::from_subset(&output_zero_point[0])
-                + constants.0[j]
-                + constants.1
-                    * f32::from_subset(&(x.0[(i, j)] - x.1[i] - constants.2[j] + constants.3)),
+        // Corrected integer accumulator (input/weight zero points folded out) plus bias.
+        let acc = x.0[(i, j)] - x.1[i] - constants.3[j] + constants.4 + constants.0[j];
+        let y = saturating_cast::<T>(
+            multiply_by_quantized_multiplier(acc, constants.1, constants.2) + output_zero_point_i32,
         );
         // Apply the fused activation function (if any)
         match options.fused_activation {
@@ -117,16 +118,17 @@ mod tests {
     const OPTIONS: FullyConnectedOptions = FullyConnectedOptions {
         fused_activation: FusedActivation::Relu,
     };
-    const CONSTANTS: (Buffer2D<f32, 4, 1>, f32, Buffer2D<i32, 1, 4>, i32) = (
-        matrix![-4.655_172_3; -3.724_138; -2.793_103_5; -1.862_069],
-        0.506_896_56,
+    const CONSTANTS: (Buffer2D<i32, 4, 1>, i32, i32, Buffer2D<i32, 1, 4>, i32) = (
+        matrix![-9; -7; -6; -4],
+        1_088_552_056,
+        0,
         matrix![312, 336, 360, 384],
         528,
     );
     const OUTPUT: Tensor2D<i8, 2, 4, 1> = Tensor2D {
         buffer: matrix![
             112, 103, 95, 87;
-            70,  67,  63, 60
+            71,  67,  63, 59
         ],
         scale: [0.29],
         zero_point: [30],

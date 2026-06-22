@@ -4,7 +4,7 @@ use simba::scalar::SupersetOf;
 
 use crate::activation::{relu, relu6, FusedActivation};
 use crate::buffer::Buffer2D;
-use crate::quantize::{quantize, requantize, Quantized};
+use crate::quantize::{multiply_by_quantized_multiplier, quantize, saturating_cast, Quantized};
 use crate::tensor::{Tensor4D, TensorView, TensorViewPadding};
 
 pub struct Conv2DOptions {
@@ -24,7 +24,7 @@ pub struct Conv2DOptions {
 /// * `options` - Operator's options as an [`Conv2DOptions`] struct
 /// * `constants` - Constant values coming from the pre-processing phase
 ///
-#[inline]
+#[inline(always)]
 pub fn conv_2d<
     T: Quantized,
     const INPUT_ROWS: usize,
@@ -43,24 +43,25 @@ pub fn conv_2d<
     output_zero_point: [T; 1],
     options: Conv2DOptions,
     constants: (
-        Buffer2D<f32, FILTERS_BATCHES, 1>,
-        Buffer2D<f32, FILTERS_QUANTS, 1>,
+        Buffer2D<i32, FILTERS_BATCHES, 1>,
+        Buffer2D<i32, FILTERS_QUANTS, 1>,
+        Buffer2D<i32, FILTERS_QUANTS, 1>,
         Buffer2D<i32, FILTERS_BATCHES, 1>,
     ),
 ) -> Tensor4D<T, 1, OUTPUT_ROWS, OUTPUT_COLS, FILTERS_BATCHES, 1> {
-    // Precompute values that are invariant across all output positions and filter batches
-    let relu6_max = quantize(6., output_scale[0], output_zero_point[0]);
-    let input_zero_point = i32::from_subset(&input.zero_point[0]);
     let output = [Buffer2D::from_fn(|i, j| {
         // Extract the view using the view extraction algorithm
         let view: TensorView<T, FILTERS_ROWS, FILTERS_COLS, INPUT_CHANS> =
             input.view((i, j), 0, options.view_padding, options.strides);
-        // Compute the view element sum once; it is shared across all filter batches
+        // Compute the view element sum once; it is shared across all filter batches.
         let view_sum = view.buffer.fold(0i32, |acc, a| {
             acc + a.iter().fold(0i32, |acc, e| acc + i32::from_subset(e))
         });
         // Perform the convolution for each filter batch
         array::from_fn(|b| {
+            let relu6_max = quantize(6., output_scale[0], output_zero_point[0]);
+            let input_zero_point = i32::from_subset(&input.zero_point[0]);
+            let output_zero_point_i32 = i32::from_subset(&output_zero_point[0]);
             let filters_zero_point = i32::from_subset(
                 &filters
                     .zero_point
@@ -85,9 +86,9 @@ pub fn conv_2d<
             // per-batch sum is used directly; only border views pay for a fold,
             // subtracting the weights that fall on padding.
             let filter_sum = if view.len == FILTERS_ROWS * FILTERS_COLS {
-                constants.2[b]
+                constants.3[b]
             } else {
-                constants.2[b]
+                constants.3[b]
                     - filters.buffer[b].zip_fold(&view.mask, 0i32, |acc, f, m| {
                         if m {
                             acc
@@ -96,19 +97,19 @@ pub fn conv_2d<
                         }
                     })
             };
-            // Elaborate the constants
-            let constants = (
-                constants.0,
-                constants.1,
-                input_zero_point * filter_sum,
-                view.len as i32 * INPUT_CHANS as i32 * input_zero_point * filters_zero_point,
-            );
-            // Combine the constant values and the variants to obtain the output
-            let y = requantize::<T>(
-                f32::from_subset(&output_zero_point[0])
-                    + constants.0[b]
-                    + constants.1.get(b).copied().unwrap_or(constants.1[0])
-                        * f32::from_subset(&(x.0 - x.1 - constants.2 + constants.3)),
+            // Corrected integer accumulator: the dot product with the input and
+            // filter zero points folded out, plus the integer bias.
+            let acc = x.0 - x.1 - input_zero_point * filter_sum
+                + view.len as i32 * INPUT_CHANS as i32 * input_zero_point * filters_zero_point
+                + constants.0[b];
+            // Requantize entirely in integer arithmetic, then add the output zero
+            // point and clamp to the quantized range.
+            let y = saturating_cast::<T>(
+                multiply_by_quantized_multiplier(
+                    acc,
+                    constants.1.get(b).copied().unwrap_or(constants.1[0]),
+                    constants.2.get(b).copied().unwrap_or(constants.2[0]),
+                ) + output_zero_point_i32,
             );
             // Apply the fused activation function (if any)
             match options.fused_activation {
@@ -167,12 +168,14 @@ mod tests {
         strides: (1, 1),
     };
     const CONSTANTS: (
-        Buffer2D<f32, 2, 1>,
-        Buffer2D<f32, 2, 1>,
+        Buffer2D<i32, 2, 1>,
+        Buffer2D<i32, 2, 1>,
+        Buffer2D<i32, 2, 1>,
         Buffer2D<i32, 2, 1>,
     ) = (
-        matrix![-3.673_469_4; -3.755_102],
-        matrix![0.103_469_39; 0.106_122_45],
+        matrix![-36; -35],
+        matrix![1_777_590_546; 1_823_169_791],
+        matrix![-3; -3],
         matrix![246; 390],
     );
     const OUTPUT: Tensor4D<i8, 1, 2, 3, 2, 1> = Tensor4D {

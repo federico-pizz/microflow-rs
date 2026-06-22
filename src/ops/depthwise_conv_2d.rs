@@ -4,7 +4,7 @@ use simba::scalar::SupersetOf;
 
 use crate::activation::{relu, relu6, FusedActivation};
 use crate::buffer::Buffer2D;
-use crate::quantize::{quantize, requantize, Quantized};
+use crate::quantize::{multiply_by_quantized_multiplier, quantize, saturating_cast, Quantized};
 use crate::tensor::{Tensor4D, TensorView, TensorViewPadding};
 
 pub struct DepthwiseConv2DOptions {
@@ -24,7 +24,7 @@ pub struct DepthwiseConv2DOptions {
 /// * `options` - Operator's options as an [`DepthwiseConv2DOptions`] struct
 /// * `constants` - Constant values coming from the pre-processing phase
 ///
-#[inline]
+#[inline(always)]
 pub fn depthwise_conv_2d<
     T: Quantized,
     const INPUT_ROWS: usize,
@@ -43,20 +43,21 @@ pub fn depthwise_conv_2d<
     output_zero_point: [T; 1],
     options: DepthwiseConv2DOptions,
     constants: (
-        Buffer2D<f32, WEIGHTS_CHANS, 1>,
-        Buffer2D<f32, WEIGHTS_QUANTS, 1>,
+        Buffer2D<i32, WEIGHTS_CHANS, 1>,
+        Buffer2D<i32, WEIGHTS_QUANTS, 1>,
+        Buffer2D<i32, WEIGHTS_QUANTS, 1>,
         Buffer2D<i32, WEIGHTS_CHANS, 1>,
     ),
 ) -> Tensor4D<T, 1, OUTPUT_ROWS, OUTPUT_COLS, WEIGHTS_CHANS, 1> {
-    // Precompute values that are invariant across all output positions and channels
-    let relu6_max = quantize(6., output_scale[0], output_zero_point[0]);
-    let input_zero_point = i32::from_subset(&input.zero_point[0]);
     let output = [Buffer2D::from_fn(|i, j| {
         // Extract the view using the view extraction algorithm
         let view: TensorView<T, WEIGHTS_ROWS, WEIGHTS_COLS, INPUT_CHANS> =
             input.view((i, j), 0, options.view_padding, options.strides);
         // Perform the convolution for each input channel
         array::from_fn(|c| {
+            let relu6_max = quantize(6., output_scale[0], output_zero_point[0]);
+            let input_zero_point = i32::from_subset(&input.zero_point[0]);
+            let output_zero_point_i32 = i32::from_subset(&output_zero_point[0]);
             let weights_zero_point = i32::from_subset(
                 &weights
                     .zero_point
@@ -76,9 +77,9 @@ pub fn depthwise_conv_2d<
             // region; interior views reuse the precomputed sum, border views
             // subtract the weights landing on padding.
             let weights_sum_c = if view.len == WEIGHTS_ROWS * WEIGHTS_COLS {
-                constants.2[c]
+                constants.3[c]
             } else {
-                constants.2[c]
+                constants.3[c]
                     - weights.buffer[0].zip_fold(&view.mask, 0i32, |acc, w, m| {
                         if m {
                             acc
@@ -87,19 +88,19 @@ pub fn depthwise_conv_2d<
                         }
                     })
             };
-            // Elaborate the constants
-            let constants = (
-                constants.0,
-                constants.1,
-                input_zero_point * weights_sum_c,
-                view.len as i32 * input_zero_point * weights_zero_point,
-            );
-            // Combine the constant values and the variants to obtain the output
-            let y = requantize::<T>(
-                f32::from_subset(&output_zero_point[0])
-                    + constants.0[c]
-                    + constants.1.get(c).copied().unwrap_or(constants.1[0])
-                        * f32::from_subset(&(x.0 - x.1 - constants.2 + constants.3)),
+            // Corrected integer accumulator: dot product with the input and weight
+            // zero points folded out, plus the integer bias.
+            let acc = x.0 - x.1 - input_zero_point * weights_sum_c
+                + view.len as i32 * input_zero_point * weights_zero_point
+                + constants.0[c];
+            // Requantize entirely in integer arithmetic, then add the output zero
+            // point and clamp to the quantized range.
+            let y = saturating_cast::<T>(
+                multiply_by_quantized_multiplier(
+                    acc,
+                    constants.1.get(c).copied().unwrap_or(constants.1[0]),
+                    constants.2.get(c).copied().unwrap_or(constants.2[0]),
+                ) + output_zero_point_i32,
             );
             // Apply the fused activation function (if any)
             match options.fused_activation {
@@ -152,18 +153,20 @@ mod tests {
         strides: (1, 1),
     };
     const CONSTANTS: (
-        Buffer2D<f32, 2, 1>,
-        Buffer2D<f32, 2, 1>,
+        Buffer2D<i32, 2, 1>,
+        Buffer2D<i32, 2, 1>,
+        Buffer2D<i32, 2, 1>,
         Buffer2D<i32, 2, 1>,
     ) = (
-        matrix![-3.567_567_6; -3.675_675_7],
-        matrix![0.094_864_86; 0.098_378_378],
+        matrix![-38; -37],
+        matrix![1_629_765_969; 1_690_127_671],
+        matrix![-3; -3],
         matrix![120; 126],
     );
     const OUTPUT: Tensor4D<i8, 1, 2, 3, 2, 1> = Tensor4D {
         buffer: [matrix![
-            [66, 63], [82, 78], [65, 62];
-            [47, 45], [52, 49], [44, 42]
+            [66, 64], [82, 78], [65, 62];
+            [47, 45], [52, 49], [45, 42]
         ]],
         scale: [0.37],
         zero_point: [38],

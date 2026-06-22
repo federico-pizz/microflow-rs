@@ -51,8 +51,5 @@ harness = false
 members = ["microflow-macros"]
 exclude = ["examples"]
 
-[patch.crates-io]
-nalgebra = { git = "https://github.com/matteocarnelos/nalgebra" }
-
 [profile.release]
 lto = true

@@ -381,3 +381,6 @@ $RECYCLE.BIN/
 
 # JupyterLab files
 .jupyter
+
+# Local working notes (not for upstream)
+docs/

@@ -49,77 +49,144 @@ pub fn conv_2d<
         Buffer2D<i32, FILTERS_BATCHES, 1>,
     ),
 ) -> Tensor4D<T, 1, OUTPUT_ROWS, OUTPUT_COLS, FILTERS_BATCHES, 1> {
-    let output = [Buffer2D::from_fn(|i, j| {
-        // Extract the view using the view extraction algorithm
-        let view: TensorView<T, FILTERS_ROWS, FILTERS_COLS, INPUT_CHANS> =
-            input.view((i, j), 0, options.view_padding, options.strides);
-        // Compute the view element sum once; it is shared across all filter batches.
-        let view_sum = view.buffer.fold(0i32, |acc, a| {
-            acc + a.iter().fold(0i32, |acc, e| acc + i32::from_subset(e))
-        });
-        // Perform the convolution for each filter batch
-        array::from_fn(|b| {
-            let relu6_max = quantize(6., output_scale[0], output_zero_point[0]);
-            let input_zero_point = i32::from_subset(&input.zero_point[0]);
-            let output_zero_point_i32 = i32::from_subset(&output_zero_point[0]);
-            let filters_zero_point = i32::from_subset(
-                &filters
-                    .zero_point
-                    .get(b)
-                    .copied()
-                    .unwrap_or(filters.zero_point[0]),
-            );
-            let x = (
-                // Perform the dot product between the input region and the filter
-                view.buffer.zip_fold(&filters.buffer[b], 0i32, |acc, v, f| {
-                    acc + v
-                        .iter()
-                        .zip(f.iter())
-                        .map(|(e1, e2)| i32::from_subset(e1) * i32::from_subset(e2))
-                        .sum::<i32>()
-                }),
-                // Use the hoisted view sum; only multiply by the per-batch filter zero point
-                view_sum * filters_zero_point,
-            );
-            // Sum of the filter weights overlapping the (unpadded) input region.
-            // For interior views the whole filter is in bounds, so the precomputed
-            // per-batch sum is used directly; only border views pay for a fold,
-            // subtracting the weights that fall on padding.
-            let filter_sum = if view.len == FILTERS_ROWS * FILTERS_COLS {
-                constants.3[b]
-            } else {
-                constants.3[b]
-                    - filters.buffer[b].zip_fold(&view.mask, 0i32, |acc, f, m| {
-                        if m {
-                            acc
-                        } else {
-                            acc + f.iter().fold(0i32, |acc, e| acc + i32::from_subset(e))
-                        }
-                    })
-            };
-            // Corrected integer accumulator: the dot product with the input and
-            // filter zero points folded out, plus the integer bias.
-            let acc = x.0 - x.1 - input_zero_point * filter_sum
-                + view.len as i32 * INPUT_CHANS as i32 * input_zero_point * filters_zero_point
-                + constants.0[b];
-            // Requantize entirely in integer arithmetic, then add the output zero
-            // point and clamp to the quantized range.
-            let y = saturating_cast::<T>(
-                multiply_by_quantized_multiplier(
-                    acc,
-                    constants.1.get(b).copied().unwrap_or(constants.1[0]),
-                    constants.2.get(b).copied().unwrap_or(constants.2[0]),
-                ) + output_zero_point_i32,
-            );
-            // Apply the fused activation function (if any)
-            match options.fused_activation {
-                FusedActivation::None => y,
-                FusedActivation::Relu => relu(y, output_zero_point[0]),
-                FusedActivation::Relu6 => relu6(y, output_zero_point[0], relu6_max),
-            }
-        })
-    })];
-    Tensor4D::new(output, output_scale, output_zero_point)
+    // Thin by-value wrapper around the in-place variant. Used by host unit tests
+    // and by the non-`buffer-reuse` codegen path.
+    let mut output = Tensor4D::new(
+        [Buffer2D::from_element([output_zero_point[0]; FILTERS_BATCHES])],
+        output_scale,
+        output_zero_point,
+    );
+    conv_2d_into(
+        &mut output,
+        &input,
+        filters,
+        output_scale,
+        output_zero_point,
+        options,
+        constants,
+    );
+    output
+}
+
+/// Performs the Conv2D operation in place, writing the result into a
+/// caller-owned output tensor instead of returning a fresh one.
+///
+/// This is the buffer-reuse entry point: by filling `&mut output` (rather than
+/// returning a value the caller must move), LLVM can coalesce the transient
+/// per-pixel results directly into the destination buffer's stack slot, which is
+/// what lets the generated ping-pong chain hit the ~2×MAX stack floor.
+///
+/// # Arguments
+/// * `output` - The 4-dimensional output tensor to fill
+/// * `input` - The 4-dimensional input tensor
+/// * `filters` - The 4-dimensional tensor representing the filters of the operator
+/// * `output_scale` - The scale of the resulting output tensor
+/// * `output_zero_point` - The zero point of the resulting output tensor
+/// * `options` - Operator's options as an [`Conv2DOptions`] struct
+/// * `constants` - Constant values coming from the pre-processing phase
+///
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+pub fn conv_2d_into<
+    T: Quantized,
+    const INPUT_ROWS: usize,
+    const INPUT_COLS: usize,
+    const INPUT_CHANS: usize,
+    const FILTERS_BATCHES: usize,
+    const FILTERS_ROWS: usize,
+    const FILTERS_COLS: usize,
+    const FILTERS_QUANTS: usize,
+    const OUTPUT_ROWS: usize,
+    const OUTPUT_COLS: usize,
+>(
+    output: &mut Tensor4D<T, 1, OUTPUT_ROWS, OUTPUT_COLS, FILTERS_BATCHES, 1>,
+    input: &Tensor4D<T, 1, INPUT_ROWS, INPUT_COLS, INPUT_CHANS, 1>,
+    filters: &Tensor4D<T, FILTERS_BATCHES, FILTERS_ROWS, FILTERS_COLS, INPUT_CHANS, FILTERS_QUANTS>,
+    output_scale: [f32; 1],
+    output_zero_point: [T; 1],
+    options: Conv2DOptions,
+    constants: (
+        Buffer2D<i32, FILTERS_BATCHES, 1>,
+        Buffer2D<i32, FILTERS_QUANTS, 1>,
+        Buffer2D<i32, FILTERS_QUANTS, 1>,
+        Buffer2D<i32, FILTERS_BATCHES, 1>,
+    ),
+) {
+    output.scale = output_scale;
+    output.zero_point = output_zero_point;
+    let buffer = &mut output.buffer[0];
+    for j in 0..OUTPUT_COLS {
+        for i in 0..OUTPUT_ROWS {
+            // Extract the view using the view extraction algorithm
+            let view: TensorView<T, FILTERS_ROWS, FILTERS_COLS, INPUT_CHANS> =
+                input.view((i, j), 0, options.view_padding, options.strides);
+            // Compute the view element sum once; it is shared across all filter batches.
+            let view_sum = view.buffer.fold(0i32, |acc, a| {
+                acc + a.iter().fold(0i32, |acc, e| acc + i32::from_subset(e))
+            });
+            // Perform the convolution for each filter batch
+            buffer[(i, j)] = array::from_fn(|b| {
+                let relu6_max = quantize(6., output_scale[0], output_zero_point[0]);
+                let input_zero_point = i32::from_subset(&input.zero_point[0]);
+                let output_zero_point_i32 = i32::from_subset(&output_zero_point[0]);
+                let filters_zero_point = i32::from_subset(
+                    &filters
+                        .zero_point
+                        .get(b)
+                        .copied()
+                        .unwrap_or(filters.zero_point[0]),
+                );
+                let x = (
+                    // Perform the dot product between the input region and the filter
+                    view.buffer.zip_fold(&filters.buffer[b], 0i32, |acc, v, f| {
+                        acc + v
+                            .iter()
+                            .zip(f.iter())
+                            .map(|(e1, e2)| i32::from_subset(e1) * i32::from_subset(e2))
+                            .sum::<i32>()
+                    }),
+                    // Use the hoisted view sum; only multiply by the per-batch filter zero point
+                    view_sum * filters_zero_point,
+                );
+                // Sum of the filter weights overlapping the (unpadded) input region.
+                // For interior views the whole filter is in bounds, so the precomputed
+                // per-batch sum is used directly; only border views pay for a fold,
+                // subtracting the weights that fall on padding.
+                let filter_sum = if view.len == FILTERS_ROWS * FILTERS_COLS {
+                    constants.3[b]
+                } else {
+                    constants.3[b]
+                        - filters.buffer[b].zip_fold(&view.mask, 0i32, |acc, f, m| {
+                            if m {
+                                acc
+                            } else {
+                                acc + f.iter().fold(0i32, |acc, e| acc + i32::from_subset(e))
+                            }
+                        })
+                };
+                // Corrected integer accumulator: the dot product with the input and
+                // filter zero points folded out, plus the integer bias.
+                let acc = x.0 - x.1 - input_zero_point * filter_sum
+                    + view.len as i32 * INPUT_CHANS as i32 * input_zero_point * filters_zero_point
+                    + constants.0[b];
+                // Requantize entirely in integer arithmetic, then add the output zero
+                // point and clamp to the quantized range.
+                let y = saturating_cast::<T>(
+                    multiply_by_quantized_multiplier(
+                        acc,
+                        constants.1.get(b).copied().unwrap_or(constants.1[0]),
+                        constants.2.get(b).copied().unwrap_or(constants.2[0]),
+                    ) + output_zero_point_i32,
+                );
+                // Apply the fused activation function (if any)
+                match options.fused_activation {
+                    FusedActivation::None => y,
+                    FusedActivation::Relu => relu(y, output_zero_point[0]),
+                    FusedActivation::Relu6 => relu6(y, output_zero_point[0], relu6_max),
+                }
+            });
+        }
+    }
 }
 
 #[cfg(test)]

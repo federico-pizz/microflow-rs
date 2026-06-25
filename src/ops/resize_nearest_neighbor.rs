@@ -35,36 +35,80 @@ pub fn resize_nearest_neighbor<
     options: ResizeNearestNeighborOptions,
     constants: (f32, f32),
 ) -> Tensor4D<T, 1, OUTPUT_ROWS, OUTPUT_COLS, INPUT_CHANS, 1> {
-    let output = [Buffer2D::from_fn(|r, c| {
-        // Calculate the corresponding row and column in the input tensor
-        let in_r = if options.half_pixel_centers {
-            ((r as f32 + 0.5) * (INPUT_ROWS as f32 / OUTPUT_ROWS as f32)) as usize
-        } else if options.align_corners && OUTPUT_ROWS > 1 {
-            roundf(r as f32 * (INPUT_ROWS - 1) as f32 / (OUTPUT_ROWS - 1) as f32) as usize
-        } else {
-            floorf(r as f32 * INPUT_ROWS as f32 / OUTPUT_ROWS as f32) as usize
-        };
+    // Thin by-value wrapper around the in-place variant. Used by host unit tests
+    // and by the non-`buffer-reuse` codegen path.
+    let mut output = Tensor4D::new(
+        [Buffer2D::from_element([output_zero_point[0]; INPUT_CHANS])],
+        output_scale,
+        output_zero_point,
+    );
+    resize_nearest_neighbor_into(
+        &mut output,
+        &input,
+        output_scale,
+        output_zero_point,
+        options,
+        constants,
+    );
+    output
+}
 
-        let in_c = if options.half_pixel_centers {
-            ((c as f32 + 0.5) * (INPUT_COLS as f32 / OUTPUT_COLS as f32)) as usize
-        } else if options.align_corners && OUTPUT_COLS > 1 {
-            roundf(c as f32 * (INPUT_COLS - 1) as f32 / (OUTPUT_COLS - 1) as f32) as usize
-        } else {
-            floorf(c as f32 * INPUT_COLS as f32 / OUTPUT_COLS as f32) as usize
-        };
+/// Performs the ResizeNearestNeighbor operation in place, writing the result
+/// into a caller-owned output tensor instead of returning a fresh one.
+///
+/// See [`crate::ops::conv_2d::conv_2d_into`] for why the in-place form is the
+/// buffer-reuse entry point.
+#[inline(always)]
+pub fn resize_nearest_neighbor_into<
+    T: Quantized,
+    const INPUT_ROWS: usize,
+    const INPUT_COLS: usize,
+    const INPUT_CHANS: usize,
+    const OUTPUT_ROWS: usize,
+    const OUTPUT_COLS: usize,
+>(
+    output: &mut Tensor4D<T, 1, OUTPUT_ROWS, OUTPUT_COLS, INPUT_CHANS, 1>,
+    input: &Tensor4D<T, 1, INPUT_ROWS, INPUT_COLS, INPUT_CHANS, 1>,
+    output_scale: [f32; 1],
+    output_zero_point: [T; 1],
+    options: ResizeNearestNeighborOptions,
+    constants: (f32, f32),
+) {
+    output.scale = output_scale;
+    output.zero_point = output_zero_point;
+    let buffer = &mut output.buffer[0];
+    for c in 0..OUTPUT_COLS {
+        for r in 0..OUTPUT_ROWS {
+            // Calculate the corresponding row and column in the input tensor
+            let in_r = if options.half_pixel_centers {
+                ((r as f32 + 0.5) * (INPUT_ROWS as f32 / OUTPUT_ROWS as f32)) as usize
+            } else if options.align_corners && OUTPUT_ROWS > 1 {
+                roundf(r as f32 * (INPUT_ROWS - 1) as f32 / (OUTPUT_ROWS - 1) as f32) as usize
+            } else {
+                floorf(r as f32 * INPUT_ROWS as f32 / OUTPUT_ROWS as f32) as usize
+            };
 
-        // Clamp indices to valid input bounds
-        let nearest_r = in_r.min(INPUT_ROWS.saturating_sub(1));
-        let nearest_c = in_c.min(INPUT_COLS.saturating_sub(1));
+            let in_c = if options.half_pixel_centers {
+                ((c as f32 + 0.5) * (INPUT_COLS as f32 / OUTPUT_COLS as f32)) as usize
+            } else if options.align_corners && OUTPUT_COLS > 1 {
+                roundf(c as f32 * (INPUT_COLS - 1) as f32 / (OUTPUT_COLS - 1) as f32) as usize
+            } else {
+                floorf(c as f32 * INPUT_COLS as f32 / OUTPUT_COLS as f32) as usize
+            };
 
-        // constants.0 and constants.1 are finite by construction; p is an integer
-        // cast to f32, so the product is always finite — no NaN/inf guard needed.
-        array::from_fn(|i| {
-            let p = f32::from_subset(&input.buffer[0][(nearest_r, nearest_c)][i]);
-            T::from_superset_unchecked(&roundf(constants.0 * p + constants.1))
-        })
-    })];
-    Tensor4D::new(output, output_scale, output_zero_point)
+            // Clamp indices to valid input bounds
+            let nearest_r = in_r.min(INPUT_ROWS.saturating_sub(1));
+            let nearest_c = in_c.min(INPUT_COLS.saturating_sub(1));
+
+            // constants.0 and constants.1 are finite by construction; p is an
+            // integer cast to f32, so the product is always finite — no NaN/inf
+            // guard needed.
+            buffer[(r, c)] = array::from_fn(|i| {
+                let p = f32::from_subset(&input.buffer[0][(nearest_r, nearest_c)][i]);
+                T::from_superset_unchecked(&roundf(constants.0 * p + constants.1))
+            });
+        }
+    }
 }
 
 #[cfg(test)]

@@ -1,5 +1,6 @@
 pub(crate) mod add;
 pub(crate) mod average_pool_2d;
+pub(crate) mod buffer_reuse;
 pub(crate) mod channel_split;
 pub(crate) mod concat;
 pub(crate) mod conv_2d;

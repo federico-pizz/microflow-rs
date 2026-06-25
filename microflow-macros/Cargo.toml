@@ -21,6 +21,12 @@ include = [
 [lib]
 proc-macro = true
 
+[features]
+# Generate the ping-pong buffer-reuse `predict_inner` for eligible linear-chain
+# Tensor4D models (see src/ops/buffer_reuse.rs). Off by default; the parent
+# `microflow` crate re-exports this as its own `buffer-reuse` feature.
+buffer-reuse = []
+
 [dependencies]
 syn = { version = "2.0", features = ["full"] }
 quote = "1.0"

@@ -20,6 +20,12 @@ include = [
     "/README.md",
 ]
 
+[features]
+# Generate the ping-pong buffer-reuse `predict_inner` for eligible linear-chain
+# Tensor4D models, collapsing peak inference stack from the sum of intermediate
+# tensors toward ~2×MAX. Off by default; behaviour is otherwise identical.
+buffer-reuse = ["microflow-macros/buffer-reuse"]
+
 [dependencies]
 microflow-macros = { version = "0.1", path = "microflow-macros" }
 nalgebra = { version = "0.32", default-features = false, features = ["macros"] }

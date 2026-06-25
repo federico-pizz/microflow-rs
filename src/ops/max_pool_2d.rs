@@ -43,30 +43,78 @@ pub fn max_pool_2d<
     options: MaxPool2DOptions,
     constants: (f32, f32),
 ) -> Tensor4D<T, 1, OUTPUT_ROWS, OUTPUT_COLS, INPUT_CHANS, 1> {
+    // Thin by-value wrapper around the in-place variant. Used by host unit tests
+    // and by the non-`buffer-reuse` codegen path.
+    let mut output = Tensor4D::new(
+        [Buffer2D::from_element([output_zero_point[0]; INPUT_CHANS])],
+        output_scale,
+        output_zero_point,
+    );
+    max_pool_2d_into(
+        &mut output,
+        &input,
+        _filter_shape,
+        output_scale,
+        output_zero_point,
+        options,
+        constants,
+    );
+    output
+}
+
+/// Performs the MaxPool2D operation in place, writing the result into a
+/// caller-owned output tensor instead of returning a fresh one.
+///
+/// See [`crate::ops::conv_2d::conv_2d_into`] for why the in-place form is the
+/// buffer-reuse entry point.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+pub fn max_pool_2d_into<
+    T: Quantized,
+    const INPUT_ROWS: usize,
+    const INPUT_COLS: usize,
+    const INPUT_CHANS: usize,
+    const FILTER_ROWS: usize,
+    const FILTER_COLS: usize,
+    const OUTPUT_ROWS: usize,
+    const OUTPUT_COLS: usize,
+>(
+    output: &mut Tensor4D<T, 1, OUTPUT_ROWS, OUTPUT_COLS, INPUT_CHANS, 1>,
+    input: &Tensor4D<T, 1, INPUT_ROWS, INPUT_COLS, INPUT_CHANS, 1>,
+    _filter_shape: (Const<FILTER_ROWS>, Const<FILTER_COLS>),
+    output_scale: [f32; 1],
+    output_zero_point: [T; 1],
+    options: MaxPool2DOptions,
+    constants: (f32, f32),
+) {
+    output.scale = output_scale;
+    output.zero_point = output_zero_point;
     let relu6_max = quantize(6., output_scale[0], output_zero_point[0]);
-    let output = [Buffer2D::from_fn(|i, j| {
-        // Extract the view using the view extraction algorithm
-        let view: TensorView<T, FILTER_ROWS, FILTER_COLS, INPUT_CHANS> =
-            input.view((i, j), 0, options.view_padding, options.strides);
-        // Compute the max pooling for each channel
-        array::from_fn(|c| {
-            let x = view.buffer.zip_fold(&view.mask, i32::MIN, |acc, a, m| {
-                if m {
-                    acc.max(i32::from_subset(&a[c]))
-                } else {
-                    acc
+    let buffer = &mut output.buffer[0];
+    for j in 0..OUTPUT_COLS {
+        for i in 0..OUTPUT_ROWS {
+            // Extract the view using the view extraction algorithm
+            let view: TensorView<T, FILTER_ROWS, FILTER_COLS, INPUT_CHANS> =
+                input.view((i, j), 0, options.view_padding, options.strides);
+            // Compute the max pooling for each channel
+            buffer[(i, j)] = array::from_fn(|c| {
+                let x = view.buffer.zip_fold(&view.mask, i32::MIN, |acc, a, m| {
+                    if m {
+                        acc.max(i32::from_subset(&a[c]))
+                    } else {
+                        acc
+                    }
+                }) as f32;
+                let y = requantize::<T>(constants.0 * x + constants.1);
+                // Apply the fused activation function (if any)
+                match options.fused_activation {
+                    FusedActivation::None => y,
+                    FusedActivation::Relu => relu(y, output_zero_point[0]),
+                    FusedActivation::Relu6 => relu6(y, output_zero_point[0], relu6_max),
                 }
-            }) as f32;
-            let y = requantize::<T>(constants.0 * x + constants.1);
-            // Apply the fused activation function (if any)
-            match options.fused_activation {
-                FusedActivation::None => y,
-                FusedActivation::Relu => relu(y, output_zero_point[0]),
-                FusedActivation::Relu6 => relu6(y, output_zero_point[0], relu6_max),
-            }
-        })
-    })];
-    Tensor4D::new(output, output_scale, output_zero_point)
+            });
+        }
+    }
 }
 
 #[cfg(test)]

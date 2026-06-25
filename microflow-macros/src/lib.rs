@@ -16,6 +16,7 @@ use quote::{format_ident, quote, ToTokens};
 use syn::{parse_macro_input, ItemStruct};
 
 use crate::tflite_flatbuffers::tflite::TensorType;
+use ops::buffer_reuse::BufferReuse;
 use ops::*;
 use structmeta::StructMeta;
 use syn::LitStr;
@@ -348,6 +349,99 @@ fn model_from_tflite(buf: &[u8], item: &ItemStruct) -> TokenStream {
         }
     }
 
+    // Buffer-reuse (ping-pong) codegen. When the `buffer-reuse` feature is on
+    // and the model is an eligible linear chain of in-place-capable Tensor4D ops
+    // (no saved/cloned tensors, no channel splits), build a `predict_inner` body
+    // that ping-pongs between two persistent enum buffers instead of shadowing a
+    // distinct-typed local per layer. This collapses peak stack from the sum of
+    // all intermediate tensors toward ~2×MAX. See ops/buffer_reuse.rs.
+    let buffer_reuse_body: Option<TokenStream2> = if cfg!(feature = "buffer-reuse")
+        && tensors_to_save.is_empty()
+        && channel_split_secondary_outputs.is_empty()
+        && input_shape.len() == 4
+        && operators.len() >= 2
+    {
+        // Collect an in-place step for every operator; bail out (None) if any op
+        // is not Tensor4D->Tensor4D in-place-capable, falling back to the shadow
+        // chain emitted above.
+        let mut steps: Vec<Box<dyn BufferReuse>> = Vec::new();
+        let mut eligible = true;
+        for (index, operator) in operators.iter().enumerate() {
+            let op_code = BuiltinOperator(
+                model
+                    .operator_codes()
+                    .unwrap()
+                    .get(operator.opcode_index() as usize)
+                    .deprecated_builtin_code() as i32,
+            );
+            let input_t = tensors
+                .get(operator.inputs().unwrap().get(0) as usize)
+                .type_();
+            let boxed: Option<Box<dyn BufferReuse>> = match op_code {
+                BuiltinOperator::CONV_2D => match input_t {
+                    TensorType::INT8 => Some(Box::new(conv_2d::TokenConv2D::<i8>::new(
+                        operator, tensors, buffers, index,
+                    ))),
+                    TensorType::UINT8 => Some(Box::new(conv_2d::TokenConv2D::<u8>::new(
+                        operator, tensors, buffers, index,
+                    ))),
+                    _ => None,
+                },
+                BuiltinOperator::DEPTHWISE_CONV_2D => match input_t {
+                    TensorType::INT8 => Some(Box::new(
+                        depthwise_conv_2d::TokenDepthwiseConv2D::<i8>::new(
+                            operator, tensors, buffers, index,
+                        ),
+                    )),
+                    TensorType::UINT8 => Some(Box::new(
+                        depthwise_conv_2d::TokenDepthwiseConv2D::<u8>::new(
+                            operator, tensors, buffers, index,
+                        ),
+                    )),
+                    _ => None,
+                },
+                BuiltinOperator::MAX_POOL_2D => match input_t {
+                    TensorType::INT8 => {
+                        Some(Box::new(max_pool_2d::TokenMaxPool2D::<i8>::new(operator, tensors)))
+                    }
+                    TensorType::UINT8 => {
+                        Some(Box::new(max_pool_2d::TokenMaxPool2D::<u8>::new(operator, tensors)))
+                    }
+                    _ => None,
+                },
+                BuiltinOperator::RESIZE_NEAREST_NEIGHBOR => match input_t {
+                    TensorType::INT8 => Some(Box::new(
+                        resize_nearest_neighbor::TokenResizeNearestNeighbor::<i8>::new(
+                            operator, tensors, buffers, index,
+                        ),
+                    )),
+                    TensorType::UINT8 => Some(Box::new(
+                        resize_nearest_neighbor::TokenResizeNearestNeighbor::<u8>::new(
+                            operator, tensors, buffers, index,
+                        ),
+                    )),
+                    _ => None,
+                },
+                _ => None,
+            };
+            match boxed {
+                Some(b) => steps.push(b),
+                None => {
+                    eligible = false;
+                    break;
+                }
+            }
+        }
+
+        if eligible {
+            Some(build_pingpong_body(&steps, &input_shape, &input_type))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     let output = tensors.get(subgraph.outputs().unwrap().get(0) as usize);
     let mut output_shape: Vec<_> = output.shape().unwrap().iter().map(|e| e as usize).collect();
     if output_shape.len() == 1 {
@@ -369,6 +463,14 @@ fn model_from_tflite(buf: &[u8], item: &ItemStruct) -> TokenStream {
         _ => unimplemented!(),
     };
 
+    let predict_inner_body = match buffer_reuse_body {
+        Some(body) => body,
+        None => quote! {
+            #layers
+            input
+        },
+    };
+
     let ts = quote! {
         #item
         impl #ident {
@@ -383,8 +485,7 @@ fn model_from_tflite(buf: &[u8], item: &ItemStruct) -> TokenStream {
             }
 
             fn predict_inner(input: microflow::tensor::#input_tensor<#input_type, #(#input_shape),*, 1usize>) -> microflow::tensor::#output_tensor<#output_type, #(#output_shape),*, 1usize> {
-                #layers
-                input
+                #predict_inner_body
             }
         }
     };
@@ -392,4 +493,143 @@ fn model_from_tflite(buf: &[u8], item: &ItemStruct) -> TokenStream {
     fs::write("target/microflow-expansion.rs", ts.to_string()).ok();
 
     ts.into()
+}
+
+/// Builds the ping-pong `predict_inner` body for an eligible linear chain.
+///
+/// Emits a per-model `enum Buf` (one variant per distinct intermediate tensor
+/// shape), the hoisted op constants, one `#[inline(always)] fn step_k` per
+/// layer (each fills a fresh `out` of the destination shape from the source via
+/// the op's `*_into` variant, then re-tags the destination buffer), and a driver
+/// that ping-pongs between two persistent `Buf` locals. See ops/buffer_reuse.rs
+/// for why the fixed-size enum + in-place fill collapses peak stack to ~2×MAX.
+fn build_pingpong_body(
+    steps: &[Box<dyn BufferReuse>],
+    input_shape: &[usize],
+    input_type: &TokenStream2,
+) -> TokenStream2 {
+    // shapes[0] = model input, shapes[k] = output of operator k (1-indexed).
+    let mut shapes: Vec<Vec<usize>> = vec![input_shape.to_vec()];
+    for step in steps {
+        shapes.push(step.br_out_shape());
+    }
+
+    // Deduplicate shapes into enum variants; `shape_variant[i]` is the variant
+    // index of `shapes[i]`.
+    let mut unique: Vec<Vec<usize>> = Vec::new();
+    let mut shape_variant: Vec<usize> = Vec::new();
+    for sh in &shapes {
+        let idx = unique.iter().position(|u| u == sh).unwrap_or_else(|| {
+            unique.push(sh.clone());
+            unique.len() - 1
+        });
+        shape_variant.push(idx);
+    }
+
+    // enum Buf { V0(Tensor4D<..>), V1(..), .. }
+    let variants = unique.iter().enumerate().map(|(i, sh)| {
+        let variant = format_ident!("V{}", i);
+        let (r, c, ch) = (sh[1], sh[2], sh[3]);
+        quote! { #variant(microflow::tensor::Tensor4D<#input_type, 1usize, #r, #c, #ch, 1usize>) }
+    });
+    let enum_def = quote! { enum Buf { #(#variants),* } };
+
+    let src_ident = format_ident!("src_t");
+    let out_ident = format_ident!("out");
+
+    // Hoisted consts (filters/weights) and one step fn per layer.
+    let mut consts = TokenStream2::new();
+    let mut step_fns = TokenStream2::new();
+    for (k, step) in steps.iter().enumerate() {
+        let step_no = k + 1;
+        let src_variant = format_ident!("V{}", shape_variant[k]);
+        let dst_variant = format_ident!("V{}", shape_variant[k + 1]);
+        let dst_shape = &shapes[k + 1];
+        let (dr, dc, dch) = (dst_shape[1], dst_shape[2], dst_shape[3]);
+        let step_fn = format_ident!("step_{}", step_no);
+        let zero_ident = format_ident!("zero_buf_{}", step_no);
+        let call = step.br_call(&src_ident, &out_ident);
+        consts.extend(step.br_consts());
+        // A compile-time `Buf` already tagged to the destination variant and
+        // holding an all-zero tensor, stored in rodata. Re-tagging `dst` by
+        // copying this const (rather than building a zero tensor and an enum
+        // wrapper on the stack) avoids any large stack temporary per step.
+        consts.extend(quote! {
+            const #zero_ident: Buf = Buf::#dst_variant(
+                microflow::tensor::Tensor4D::new(
+                    [nalgebra::Matrix::from_array_storage(nalgebra::ArrayStorage(
+                        [[[0 as #input_type; #dch]; #dr]; #dc],
+                    ))],
+                    [0f32],
+                    [0 as #input_type],
+                ),
+            );
+        });
+        // Re-tag `dst` from the const, then fill that payload in place via the
+        // op's `*_into` variant. Keeping the only large storage inside the two
+        // persistent buffers (no moved-out local, no stack-built zero or enum
+        // wrapper) is what lets peak stack collapse toward ~2×MAX rather than
+        // the sum.
+        step_fns.extend(quote! {
+            #[inline(never)]
+            fn #step_fn(dst: &mut Buf, src: &Buf) {
+                let #src_ident = match src {
+                    Buf::#src_variant(t) => t,
+                    _ => ::core::unreachable!(),
+                };
+                *dst = #zero_ident;
+                let #out_ident = match dst {
+                    Buf::#dst_variant(t) => t,
+                    _ => ::core::unreachable!(),
+                };
+                #call
+            }
+        });
+    }
+
+    // Driver: two persistent buffers, alternating destination each step.
+    let n = steps.len();
+    let in_variant = format_ident!("V{}", shape_variant[0]);
+    let out_variant = format_ident!("V{}", shape_variant[n]);
+    let (ir, ic, ich) = (input_shape[1], input_shape[2], input_shape[3]);
+
+    let mut calls = TokenStream2::new();
+    for step_no in 1..=n {
+        let step_fn = format_ident!("step_{}", step_no);
+        if step_no % 2 == 1 {
+            calls.extend(quote! { #step_fn(&mut buf_b, &buf_a); });
+        } else {
+            calls.extend(quote! { #step_fn(&mut buf_a, &buf_b); });
+        }
+    }
+    let final_buf = if n % 2 == 1 {
+        quote!(buf_b)
+    } else {
+        quote!(buf_a)
+    };
+
+    quote! {
+        #enum_def
+        #consts
+        #step_fns
+        // `buf_b`'s initial value is overwritten by the first step; build it from
+        // a rodata const so the placeholder costs no stack.
+        const ZERO_BUF_IN: Buf = Buf::#in_variant(
+            microflow::tensor::Tensor4D::new(
+                [nalgebra::Matrix::from_array_storage(nalgebra::ArrayStorage(
+                    [[[0 as #input_type; #ich]; #ir]; #ic],
+                ))],
+                [0f32],
+                [0 as #input_type],
+            ),
+        );
+        let mut buf_a = Buf::#in_variant(input);
+        let mut buf_b = ZERO_BUF_IN;
+        #calls
+        let input = match #final_buf {
+            Buf::#out_variant(t) => t,
+            _ => ::core::unreachable!(),
+        };
+        input
+    }
 }

@@ -25,6 +25,15 @@ include = [
 # Tensor4D models, collapsing peak inference stack from the sum of intermediate
 # tensors toward ~2×MAX. Off by default; behaviour is otherwise identical.
 buffer-reuse = ["microflow-macros/buffer-reuse"]
+# ESP32-S3 dual-core (APP-core) parallelism for inference: heavy conv/depthwise
+# layers split their output rows across the two cores. Off by default, so host
+# and other targets use the single-core scalar path and the nano_u fingerprint
+# stays byte-unchanged. The firmware owns CPU_CTRL + the app-core stack and
+# starts the second core into `multicore::worker_loop`; microflow provides the
+# no-heap barrier / row-dispatch primitive. Pairs with `buffer-reuse`, which
+# frees the stack the second core's output band needs. See
+# docs/ESP32_S3_MULTICORE.md.
+multicore = []
 
 [dependencies]
 microflow-macros = { version = "0.1", path = "microflow-macros" }

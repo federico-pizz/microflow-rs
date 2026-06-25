@@ -10,6 +10,8 @@ pub use microflow_macros::*;
 
 pub mod activation;
 pub mod buffer;
+#[cfg(feature = "multicore")]
+pub mod multicore;
 pub mod ops;
 pub mod quantize;
 pub mod tensor;

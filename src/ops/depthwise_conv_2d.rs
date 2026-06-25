@@ -26,7 +26,11 @@ pub struct DepthwiseConv2DOptions {
 ///
 #[inline(always)]
 pub fn depthwise_conv_2d<
-    T: Quantized,
+    // `Sync` lets the per-pixel closure (which borrows only the immutable input,
+    // weights and constants) be shared across the two cores under `multicore`.
+    // All instantiated quantized types (`i8`, `u8`) are `Sync`, so this does not
+    // restrict callers.
+    T: Quantized + Sync,
     const INPUT_ROWS: usize,
     const INPUT_COLS: usize,
     const INPUT_CHANS: usize,
@@ -52,7 +56,9 @@ pub fn depthwise_conv_2d<
     // Thin by-value wrapper around the in-place variant. Used by host unit tests
     // and by the non-`buffer-reuse` codegen path.
     let mut output = Tensor4D::new(
-        [Buffer2D::from_element([output_zero_point[0]; WEIGHTS_CHANS])],
+        [Buffer2D::from_element(
+            [output_zero_point[0]; WEIGHTS_CHANS],
+        )],
         output_scale,
         output_zero_point,
     );
@@ -86,7 +92,11 @@ pub fn depthwise_conv_2d<
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
 pub fn depthwise_conv_2d_into<
-    T: Quantized,
+    // `Sync` lets the per-pixel closure (which borrows only the immutable input,
+    // weights and constants) be shared across the two cores under `multicore`.
+    // All instantiated quantized types (`i8`, `u8`) are `Sync`, so this does not
+    // restrict callers.
+    T: Quantized + Sync,
     const INPUT_ROWS: usize,
     const INPUT_COLS: usize,
     const INPUT_CHANS: usize,
@@ -112,69 +122,106 @@ pub fn depthwise_conv_2d_into<
 ) {
     output.scale = output_scale;
     output.zero_point = output_zero_point;
-    let buffer = &mut output.buffer[0];
-    for j in 0..OUTPUT_COLS {
-        for i in 0..OUTPUT_ROWS {
-            // Extract the view using the view extraction algorithm
-            let view: TensorView<T, WEIGHTS_ROWS, WEIGHTS_COLS, INPUT_CHANS> =
-                input.view((i, j), 0, options.view_padding, options.strides);
-            // Perform the convolution for each input channel
-            buffer[(i, j)] = array::from_fn(|c| {
-                let relu6_max = quantize(6., output_scale[0], output_zero_point[0]);
-                let input_zero_point = i32::from_subset(&input.zero_point[0]);
-                let output_zero_point_i32 = i32::from_subset(&output_zero_point[0]);
-                let weights_zero_point = i32::from_subset(
-                    &weights
-                        .zero_point
-                        .get(c)
-                        .copied()
-                        .unwrap_or(weights.zero_point[0]),
-                );
-                // Single pass: accumulate MAC and per-channel view sum simultaneously
-                let (mac, view_sum_c) =
-                    view.buffer
-                        .zip_fold(&weights.buffer[0], (0i32, 0i32), |acc, v, w| {
-                            let v_c = i32::from_subset(&v.get(c).copied().unwrap_or(v[0]));
-                            (acc.0 + v_c * i32::from_subset(&w[c]), acc.1 + v_c)
-                        });
-                let x = (mac, view_sum_c * weights_zero_point);
-                // Per-channel sum of the weights overlapping the (unpadded) input
-                // region; interior views reuse the precomputed sum, border views
-                // subtract the weights landing on padding.
-                let weights_sum_c = if view.len == WEIGHTS_ROWS * WEIGHTS_COLS {
-                    constants.3[c]
-                } else {
-                    constants.3[c]
-                        - weights.buffer[0].zip_fold(&view.mask, 0i32, |acc, w, m| {
-                            if m {
-                                acc
-                            } else {
-                                acc + i32::from_subset(&w[c])
-                            }
-                        })
-                };
-                // Corrected integer accumulator: dot product with the input and weight
-                // zero points folded out, plus the integer bias.
-                let acc = x.0 - x.1 - input_zero_point * weights_sum_c
-                    + view.len as i32 * input_zero_point * weights_zero_point
-                    + constants.0[c];
-                // Requantize entirely in integer arithmetic, then add the output zero
-                // point and clamp to the quantized range.
-                let y = saturating_cast::<T>(
-                    multiply_by_quantized_multiplier(
-                        acc,
-                        constants.1.get(c).copied().unwrap_or(constants.1[0]),
-                        constants.2.get(c).copied().unwrap_or(constants.2[0]),
-                    ) + output_zero_point_i32,
-                );
-                // Apply the fused activation function (if any)
-                match options.fused_activation {
-                    FusedActivation::None => y,
-                    FusedActivation::Relu => relu(y, output_zero_point[0]),
-                    FusedActivation::Relu6 => relu6(y, output_zero_point[0], relu6_max),
-                }
-            });
+
+    // Per-output-pixel computation: the channel vector at output `(i, j)`. Shared
+    // by the single-core path and (under `multicore`) by both cores, each filling
+    // a disjoint band of output rows. It borrows only shared, immutable data, so
+    // it is `Sync` and safe to invoke concurrently.
+    let pixel = |i: usize, j: usize| -> [T; WEIGHTS_CHANS] {
+        // Extract the view using the view extraction algorithm
+        let view: TensorView<T, WEIGHTS_ROWS, WEIGHTS_COLS, INPUT_CHANS> =
+            input.view((i, j), 0, options.view_padding, options.strides);
+        // Perform the convolution for each input channel
+        array::from_fn(|c| {
+            let relu6_max = quantize(6., output_scale[0], output_zero_point[0]);
+            let input_zero_point = i32::from_subset(&input.zero_point[0]);
+            let output_zero_point_i32 = i32::from_subset(&output_zero_point[0]);
+            let weights_zero_point = i32::from_subset(
+                &weights
+                    .zero_point
+                    .get(c)
+                    .copied()
+                    .unwrap_or(weights.zero_point[0]),
+            );
+            // Single pass: accumulate MAC and per-channel view sum simultaneously
+            let (mac, view_sum_c) =
+                view.buffer
+                    .zip_fold(&weights.buffer[0], (0i32, 0i32), |acc, v, w| {
+                        let v_c = i32::from_subset(&v.get(c).copied().unwrap_or(v[0]));
+                        (acc.0 + v_c * i32::from_subset(&w[c]), acc.1 + v_c)
+                    });
+            let x = (mac, view_sum_c * weights_zero_point);
+            // Per-channel sum of the weights overlapping the (unpadded) input
+            // region; interior views reuse the precomputed sum, border views
+            // subtract the weights landing on padding.
+            let weights_sum_c = if view.len == WEIGHTS_ROWS * WEIGHTS_COLS {
+                constants.3[c]
+            } else {
+                constants.3[c]
+                    - weights.buffer[0].zip_fold(&view.mask, 0i32, |acc, w, m| {
+                        if m {
+                            acc
+                        } else {
+                            acc + i32::from_subset(&w[c])
+                        }
+                    })
+            };
+            // Corrected integer accumulator: dot product with the input and weight
+            // zero points folded out, plus the integer bias.
+            let acc = x.0 - x.1 - input_zero_point * weights_sum_c
+                + view.len as i32 * input_zero_point * weights_zero_point
+                + constants.0[c];
+            // Requantize entirely in integer arithmetic, then add the output zero
+            // point and clamp to the quantized range.
+            let y = saturating_cast::<T>(
+                multiply_by_quantized_multiplier(
+                    acc,
+                    constants.1.get(c).copied().unwrap_or(constants.1[0]),
+                    constants.2.get(c).copied().unwrap_or(constants.2[0]),
+                ) + output_zero_point_i32,
+            );
+            // Apply the fused activation function (if any)
+            match options.fused_activation {
+                FusedActivation::None => y,
+                FusedActivation::Relu => relu(y, output_zero_point[0]),
+                FusedActivation::Relu6 => relu6(y, output_zero_point[0], relu6_max),
+            }
+        })
+    };
+
+    // Single-core: fill the caller-owned output buffer in place, row by row.
+    #[cfg(not(feature = "multicore"))]
+    {
+        let buffer = &mut output.buffer[0];
+        for j in 0..OUTPUT_COLS {
+            for i in 0..OUTPUT_ROWS {
+                buffer[(i, j)] = pixel(i, j);
+            }
         }
+    }
+
+    // Dual-core: split the output rows across both cores, each writing its own
+    // disjoint band directly into the (already caller-owned) output buffer via a
+    // shared raw pointer. No extra output buffer is allocated — that is why this
+    // needs `buffer-reuse`: the destination already lives in a reused ping-pong
+    // slot, so the second core's band costs no additional stack. The join barrier
+    // in `parallel_for_rows` orders all writes before the result is read.
+    #[cfg(feature = "multicore")]
+    {
+        let base: crate::multicore::SharedRows<[T; WEIGHTS_CHANS]> =
+            crate::multicore::SharedRows(output.buffer[0].as_mut_slice().as_mut_ptr());
+        crate::multicore::parallel_for_rows(OUTPUT_ROWS, |r0, r1| {
+            // Capture the whole `SharedRows` (Copy, Sync), not the bare `*mut`.
+            let base = base;
+            for i in r0..r1 {
+                for j in 0..OUTPUT_COLS {
+                    // SAFETY: column-major index `j*OUTPUT_ROWS + i` is in bounds
+                    // (i < OUTPUT_ROWS, j < OUTPUT_COLS); the two cores cover
+                    // disjoint row bands, so writes never alias.
+                    unsafe { base.0.add(j * OUTPUT_ROWS + i).write(pixel(i, j)) };
+                }
+            }
+        });
     }
 }
 

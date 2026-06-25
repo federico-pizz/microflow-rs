@@ -26,7 +26,11 @@ pub struct Conv2DOptions {
 ///
 #[inline(always)]
 pub fn conv_2d<
-    T: Quantized,
+    // `Sync` lets the per-pixel closure (which borrows only the immutable input,
+    // filters and constants) be shared across the two cores under `multicore`.
+    // All instantiated quantized types (`i8`, `u8`) are `Sync`, so this does not
+    // restrict callers.
+    T: Quantized + Sync,
     const INPUT_ROWS: usize,
     const INPUT_COLS: usize,
     const INPUT_CHANS: usize,
@@ -52,7 +56,9 @@ pub fn conv_2d<
     // Thin by-value wrapper around the in-place variant. Used by host unit tests
     // and by the non-`buffer-reuse` codegen path.
     let mut output = Tensor4D::new(
-        [Buffer2D::from_element([output_zero_point[0]; FILTERS_BATCHES])],
+        [Buffer2D::from_element(
+            [output_zero_point[0]; FILTERS_BATCHES],
+        )],
         output_scale,
         output_zero_point,
     );
@@ -88,7 +94,11 @@ pub fn conv_2d<
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
 pub fn conv_2d_into<
-    T: Quantized,
+    // `Sync` lets the per-pixel closure (which borrows only the immutable input,
+    // filters and constants) be shared across the two cores under `multicore`.
+    // All instantiated quantized types (`i8`, `u8`) are `Sync`, so this does not
+    // restrict callers.
+    T: Quantized + Sync,
     const INPUT_ROWS: usize,
     const INPUT_COLS: usize,
     const INPUT_CHANS: usize,
@@ -114,78 +124,116 @@ pub fn conv_2d_into<
 ) {
     output.scale = output_scale;
     output.zero_point = output_zero_point;
-    let buffer = &mut output.buffer[0];
-    for j in 0..OUTPUT_COLS {
-        for i in 0..OUTPUT_ROWS {
-            // Extract the view using the view extraction algorithm
-            let view: TensorView<T, FILTERS_ROWS, FILTERS_COLS, INPUT_CHANS> =
-                input.view((i, j), 0, options.view_padding, options.strides);
-            // Compute the view element sum once; it is shared across all filter batches.
-            let view_sum = view.buffer.fold(0i32, |acc, a| {
-                acc + a.iter().fold(0i32, |acc, e| acc + i32::from_subset(e))
-            });
-            // Perform the convolution for each filter batch
-            buffer[(i, j)] = array::from_fn(|b| {
-                let relu6_max = quantize(6., output_scale[0], output_zero_point[0]);
-                let input_zero_point = i32::from_subset(&input.zero_point[0]);
-                let output_zero_point_i32 = i32::from_subset(&output_zero_point[0]);
-                let filters_zero_point = i32::from_subset(
-                    &filters
-                        .zero_point
-                        .get(b)
-                        .copied()
-                        .unwrap_or(filters.zero_point[0]),
-                );
-                let x = (
-                    // Perform the dot product between the input region and the filter
-                    view.buffer.zip_fold(&filters.buffer[b], 0i32, |acc, v, f| {
-                        acc + v
-                            .iter()
-                            .zip(f.iter())
-                            .map(|(e1, e2)| i32::from_subset(e1) * i32::from_subset(e2))
-                            .sum::<i32>()
-                    }),
-                    // Use the hoisted view sum; only multiply by the per-batch filter zero point
-                    view_sum * filters_zero_point,
-                );
-                // Sum of the filter weights overlapping the (unpadded) input region.
-                // For interior views the whole filter is in bounds, so the precomputed
-                // per-batch sum is used directly; only border views pay for a fold,
-                // subtracting the weights that fall on padding.
-                let filter_sum = if view.len == FILTERS_ROWS * FILTERS_COLS {
-                    constants.3[b]
-                } else {
-                    constants.3[b]
-                        - filters.buffer[b].zip_fold(&view.mask, 0i32, |acc, f, m| {
-                            if m {
-                                acc
-                            } else {
-                                acc + f.iter().fold(0i32, |acc, e| acc + i32::from_subset(e))
-                            }
-                        })
-                };
-                // Corrected integer accumulator: the dot product with the input and
-                // filter zero points folded out, plus the integer bias.
-                let acc = x.0 - x.1 - input_zero_point * filter_sum
-                    + view.len as i32 * INPUT_CHANS as i32 * input_zero_point * filters_zero_point
-                    + constants.0[b];
-                // Requantize entirely in integer arithmetic, then add the output zero
-                // point and clamp to the quantized range.
-                let y = saturating_cast::<T>(
-                    multiply_by_quantized_multiplier(
-                        acc,
-                        constants.1.get(b).copied().unwrap_or(constants.1[0]),
-                        constants.2.get(b).copied().unwrap_or(constants.2[0]),
-                    ) + output_zero_point_i32,
-                );
-                // Apply the fused activation function (if any)
-                match options.fused_activation {
-                    FusedActivation::None => y,
-                    FusedActivation::Relu => relu(y, output_zero_point[0]),
-                    FusedActivation::Relu6 => relu6(y, output_zero_point[0], relu6_max),
-                }
-            });
+
+    // Per-output-pixel computation: the filter-batch vector at output `(i, j)`.
+    // Shared by the single-core path and (under `multicore`) by both cores, each
+    // filling a disjoint band of output rows. It borrows only shared, immutable
+    // data, so it is `Sync` and safe to invoke concurrently.
+    let pixel = |i: usize, j: usize| -> [T; FILTERS_BATCHES] {
+        // Extract the view using the view extraction algorithm
+        let view: TensorView<T, FILTERS_ROWS, FILTERS_COLS, INPUT_CHANS> =
+            input.view((i, j), 0, options.view_padding, options.strides);
+        // Compute the view element sum once; it is shared across all filter batches.
+        let view_sum = view.buffer.fold(0i32, |acc, a| {
+            acc + a.iter().fold(0i32, |acc, e| acc + i32::from_subset(e))
+        });
+        // Perform the convolution for each filter batch
+        array::from_fn(|b| {
+            let relu6_max = quantize(6., output_scale[0], output_zero_point[0]);
+            let input_zero_point = i32::from_subset(&input.zero_point[0]);
+            let output_zero_point_i32 = i32::from_subset(&output_zero_point[0]);
+            let filters_zero_point = i32::from_subset(
+                &filters
+                    .zero_point
+                    .get(b)
+                    .copied()
+                    .unwrap_or(filters.zero_point[0]),
+            );
+            let x = (
+                // Perform the dot product between the input region and the filter
+                view.buffer.zip_fold(&filters.buffer[b], 0i32, |acc, v, f| {
+                    acc + v
+                        .iter()
+                        .zip(f.iter())
+                        .map(|(e1, e2)| i32::from_subset(e1) * i32::from_subset(e2))
+                        .sum::<i32>()
+                }),
+                // Use the hoisted view sum; only multiply by the per-batch filter zero point
+                view_sum * filters_zero_point,
+            );
+            // Sum of the filter weights overlapping the (unpadded) input region.
+            // For interior views the whole filter is in bounds, so the precomputed
+            // per-batch sum is used directly; only border views pay for a fold,
+            // subtracting the weights that fall on padding.
+            let filter_sum = if view.len == FILTERS_ROWS * FILTERS_COLS {
+                constants.3[b]
+            } else {
+                constants.3[b]
+                    - filters.buffer[b].zip_fold(&view.mask, 0i32, |acc, f, m| {
+                        if m {
+                            acc
+                        } else {
+                            acc + f.iter().fold(0i32, |acc, e| acc + i32::from_subset(e))
+                        }
+                    })
+            };
+            // Corrected integer accumulator: the dot product with the input and
+            // filter zero points folded out, plus the integer bias.
+            let acc = x.0 - x.1 - input_zero_point * filter_sum
+                + view.len as i32 * INPUT_CHANS as i32 * input_zero_point * filters_zero_point
+                + constants.0[b];
+            // Requantize entirely in integer arithmetic, then add the output zero
+            // point and clamp to the quantized range.
+            let y = saturating_cast::<T>(
+                multiply_by_quantized_multiplier(
+                    acc,
+                    constants.1.get(b).copied().unwrap_or(constants.1[0]),
+                    constants.2.get(b).copied().unwrap_or(constants.2[0]),
+                ) + output_zero_point_i32,
+            );
+            // Apply the fused activation function (if any)
+            match options.fused_activation {
+                FusedActivation::None => y,
+                FusedActivation::Relu => relu(y, output_zero_point[0]),
+                FusedActivation::Relu6 => relu6(y, output_zero_point[0], relu6_max),
+            }
+        })
+    };
+
+    // Single-core: fill the caller-owned output buffer in place, row by row.
+    #[cfg(not(feature = "multicore"))]
+    {
+        let buffer = &mut output.buffer[0];
+        for j in 0..OUTPUT_COLS {
+            for i in 0..OUTPUT_ROWS {
+                buffer[(i, j)] = pixel(i, j);
+            }
         }
+    }
+
+    // Dual-core: split the output rows across both cores, each writing its own
+    // disjoint band directly into the (already caller-owned) output buffer via a
+    // shared raw pointer. No extra output buffer is allocated — that is exactly
+    // why this needs `buffer-reuse`: the destination already lives in a reused
+    // ping-pong slot, so the second core's band costs no additional stack. The
+    // join barrier in `parallel_for_rows` orders all writes before the result is
+    // read.
+    #[cfg(feature = "multicore")]
+    {
+        let base: crate::multicore::SharedRows<[T; FILTERS_BATCHES]> =
+            crate::multicore::SharedRows(output.buffer[0].as_mut_slice().as_mut_ptr());
+        crate::multicore::parallel_for_rows(OUTPUT_ROWS, |r0, r1| {
+            // Capture the whole `SharedRows` (Copy, Sync), not the bare `*mut`.
+            let base = base;
+            for i in r0..r1 {
+                for j in 0..OUTPUT_COLS {
+                    // SAFETY: column-major index `j*OUTPUT_ROWS + i` is in bounds
+                    // (i < OUTPUT_ROWS, j < OUTPUT_COLS); the two cores cover
+                    // disjoint row bands, so writes never alias.
+                    unsafe { base.0.add(j * OUTPUT_ROWS + i).write(pixel(i, j)) };
+                }
+            }
+        });
     }
 }
 

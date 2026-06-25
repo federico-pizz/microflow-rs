@@ -13,5 +13,7 @@ pub mod buffer;
 #[cfg(feature = "multicore")]
 pub mod multicore;
 pub mod ops;
+#[cfg(feature = "profiling")]
+pub mod profile;
 pub mod quantize;
 pub mod tensor;

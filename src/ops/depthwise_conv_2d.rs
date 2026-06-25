@@ -120,6 +120,8 @@ pub fn depthwise_conv_2d_into<
         Buffer2D<i32, WEIGHTS_CHANS, 1>,
     ),
 ) {
+    #[cfg(feature = "profiling")]
+    let _prof_start = crate::profile::now();
     output.scale = output_scale;
     output.zero_point = output_zero_point;
 
@@ -223,6 +225,9 @@ pub fn depthwise_conv_2d_into<
             }
         });
     }
+
+    #[cfg(feature = "profiling")]
+    crate::profile::record(crate::profile::OP_DEPTHWISE, _prof_start);
 }
 
 #[cfg(test)]

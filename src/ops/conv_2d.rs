@@ -122,6 +122,8 @@ pub fn conv_2d_into<
         Buffer2D<i32, FILTERS_BATCHES, 1>,
     ),
 ) {
+    #[cfg(feature = "profiling")]
+    let _prof_start = crate::profile::now();
     output.scale = output_scale;
     output.zero_point = output_zero_point;
 
@@ -235,6 +237,9 @@ pub fn conv_2d_into<
             }
         });
     }
+
+    #[cfg(feature = "profiling")]
+    crate::profile::record(crate::profile::OP_CONV, _prof_start);
 }
 
 #[cfg(test)]

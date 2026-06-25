@@ -87,6 +87,8 @@ pub fn max_pool_2d_into<
     options: MaxPool2DOptions,
     constants: (f32, f32),
 ) {
+    #[cfg(feature = "profiling")]
+    let _prof_start = crate::profile::now();
     output.scale = output_scale;
     output.zero_point = output_zero_point;
     let relu6_max = quantize(6., output_scale[0], output_zero_point[0]);
@@ -115,6 +117,9 @@ pub fn max_pool_2d_into<
             });
         }
     }
+
+    #[cfg(feature = "profiling")]
+    crate::profile::record(crate::profile::OP_MAXPOOL, _prof_start);
 }
 
 #[cfg(test)]

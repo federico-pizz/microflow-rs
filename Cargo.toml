@@ -34,6 +34,11 @@ buffer-reuse = ["microflow-macros/buffer-reuse"]
 # frees the stack the second core's output band needs. See
 # docs/ESP32_S3_MULTICORE.md.
 multicore = []
+# Per-layer latency profiling (diagnostic, off by default). Each in-place op
+# records its wall-clock duration into `microflow::profile`; the host/firmware
+# installs a timestamp hook and reads the per-layer table back. No effect on
+# results; adds two timestamp reads per layer when enabled.
+profiling = []
 
 [dependencies]
 microflow-macros = { version = "0.1", path = "microflow-macros" }

@@ -74,6 +74,8 @@ pub fn resize_nearest_neighbor_into<
     options: ResizeNearestNeighborOptions,
     constants: (f32, f32),
 ) {
+    #[cfg(feature = "profiling")]
+    let _prof_start = crate::profile::now();
     output.scale = output_scale;
     output.zero_point = output_zero_point;
     let buffer = &mut output.buffer[0];
@@ -109,6 +111,9 @@ pub fn resize_nearest_neighbor_into<
             });
         }
     }
+
+    #[cfg(feature = "profiling")]
+    crate::profile::record(crate::profile::OP_RESIZE, _prof_start);
 }
 
 #[cfg(test)]
